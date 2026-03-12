@@ -19,7 +19,7 @@ from prettytable import PrettyTable
 # ──────────────────────────────────────────────
 API_KEY: str = os.getenv(
     "THERUNDOWN_API_KEY",
-    "b05e571893ea8db8950f9b6497d480ad7a5547ddcbc5064131a8e3bfe713599d"
+    "e6b5c7622d7411381bfcf2ade1f8776eaa247e22cddcade8ca495062991fac96"
 )
 USE_RAPIDAPI:   bool  = False
 TOTAL_STAKE:    float = 100.0
@@ -32,6 +32,11 @@ LIVE_ONLY:        bool = True
 # only consider games that have not started yet (with tolerance)
 PRE_GAME_MINUTES: int  = 10     # include games starting within this many minutes of now
 SHOW_NEAR_ARBS:   bool = False  # when False, hide near-arb section in output
+
+# Book restriction (use only these books when enabled)
+RESTRICT_BOOKS: bool = True
+ALLOWED_BOOK_IDS: set[int] = {3, 19, 23}  # Pinnacle=3, DraftKings=19, FanDuel=23
+DEBUG_BOOK_COVERAGE: bool = False  # print one-line diagnostics when key books missing
 
 # Only keep true, positive-profit arbs (arb < 1.0)
 ARB_THRESHOLD: float = 0.0
@@ -180,7 +185,7 @@ def to_decimal(val) -> float:
 # ──────────────────────────────────────────────
 # LINE EXTRACTION — markets-based, line-aware
 # ──────────────────────────────────────────────
-def build_market_index(event: dict) -> tuple[dict, dict]:
+def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
     """
     Build a per-event index of available prices grouped by (market kind, line value).
 
@@ -203,12 +208,14 @@ def build_market_index(event: dict) -> tuple[dict, dict]:
     """
     markets = event.get("markets") or []
     if not isinstance(markets, list):
-        return {}, {}
+        return {}, {}, set(), set()
 
     index: dict[tuple[str, float | None], dict[str, list[dict]]] = {}
     # For spreads we also maintain complementary buckets by absolute line value:
     # abs_line -> {"home_minus": [...], "away_plus": [...]}
     spread_pairs: dict[float, dict[str, list[dict]]] = {}
+    raw_book_ids_seen: set[int] = set()
+    used_book_ids_seen: set[int] = set()
 
     for m in markets:
         if not isinstance(m, dict):
@@ -279,6 +286,9 @@ def build_market_index(event: dict) -> tuple[dict, dict]:
                         book_id = int(raw_book_id)
                     except (ValueError, TypeError):
                         continue
+                    raw_book_ids_seen.add(book_id)
+                    if RESTRICT_BOOKS and book_id not in ALLOWED_BOOK_IDS:
+                        continue
                     if not isinstance(price_obj, dict):
                         continue
 
@@ -291,6 +301,7 @@ def build_market_index(event: dict) -> tuple[dict, dict]:
 
                     book_name = KNOWN_BOOKS.get(book_id, f"Book{book_id}")
                     updated_at = price_obj.get("updated_at")
+                    used_book_ids_seen.add(book_id)
 
                     kind = "ml" if is_ml else ("spread" if is_spread else "total")
                     key = (kind, line_value if kind != "ml" else None)
@@ -327,7 +338,7 @@ def build_market_index(event: dict) -> tuple[dict, dict]:
                                 }
                             )
 
-    return index, spread_pairs
+    return index, spread_pairs, raw_book_ids_seen, used_book_ids_seen
 
 
 # ──────────────────────────────────────────────
@@ -351,9 +362,19 @@ def analyze_event(event: dict, sport_name: str) -> list:
         away = tn[1].get("name", "Away") if len(tn) > 1 else "Away"
     game  = f"{away} @ {home}"
 
-    market_index, spread_pairs = build_market_index(event)
+    market_index, spread_pairs, raw_book_ids, used_book_ids = build_market_index(event)
     if not market_index:
         return []
+
+    if DEBUG_BOOK_COVERAGE:
+        missing = []
+        if 3 not in raw_book_ids:
+            missing.append("pinnacle")
+        if 23 not in raw_book_ids:
+            missing.append("fanduel")
+        if missing:
+            raw_names = ", ".join(KNOWN_BOOKS.get(b, f"Book{b}") for b in sorted(raw_book_ids)[:10])
+            print(f"  ⚠ [{sport_name}] {game} missing raw books: {', '.join(missing)} (raw seen: {raw_names})")
 
     results: list[dict] = []
 

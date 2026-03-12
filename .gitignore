@@ -1,0 +1,6 @@
+__pycache__/
+.cursor/
+*.pyc
+frontend/node_modules/
+node_modules/
+

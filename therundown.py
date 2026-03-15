@@ -19,7 +19,7 @@ from prettytable import PrettyTable
 # ──────────────────────────────────────────────
 API_KEY: str = os.getenv(
     "THERUNDOWN_API_KEY",
-    "e6b5c7622d7411381bfcf2ade1f8776eaa247e22cddcade8ca495062991fac96"
+    "b05e571893ea8db8950f9b6497d480ad7a5547ddcbc5064131a8e3bfe713599d"
 )
 USE_RAPIDAPI:   bool  = False
 TOTAL_STAKE:    float = 100.0
@@ -35,8 +35,9 @@ SHOW_NEAR_ARBS:   bool = False  # when False, hide near-arb section in output
 
 # Book restriction (use only these books when enabled)
 RESTRICT_BOOKS: bool = True
-ALLOWED_BOOK_IDS: set[int] = {3, 19, 23}  # Pinnacle=3, DraftKings=19, FanDuel=23
+ALLOWED_BOOK_NAMES: set[str] = {"pinnacle", "draftkings", "fanduel"}
 DEBUG_BOOK_COVERAGE: bool = False  # print one-line diagnostics when key books missing
+ARB_MAX_LINE_AGE_S: int = 1800  # 30 min — both arb legs must be updated within this window
 
 # Only keep true, positive-profit arbs (arb < 1.0)
 ARB_THRESHOLD: float = 0.0
@@ -110,15 +111,48 @@ class RundownClient:
 
     def _get(self, path, params=None):
         url = f"{self.base_url}{path}"
-        resp = self.session.get(url, params=params or {}, timeout=15)
-        self.last_headers = dict(resp.headers)
-        resp.raise_for_status()
-        return resp.json()
+        print(f"API_REQUEST: GET {url} with params {params}")
+        try:
+            resp = self.session.get(url, params=params or {}, timeout=15)
+            self.last_headers = dict(resp.headers)
+            raw_payload = resp.text
+            dp_cost = resp.headers.get("X-Datapoints", "?")
+            dp_used = resp.headers.get("X-Datapoints-Used", "?")
+            dp_rem  = resp.headers.get("X-Datapoints-Remaining", "?")
+            print(f"API_RESPONSE: HTTP {resp.status_code} | {len(raw_payload)} bytes | dp_cost={dp_cost} used={dp_used} remaining={dp_rem}")
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                print("API_ERROR: 401 Unauthorized - Check your API key")
+            elif e.response.status_code == 429:
+                print("API_ERROR: 429 Too Many Requests - Rate limit exceeded")
+            elif e.response.status_code >= 500:
+                print(f"API_ERROR: {e.response.status_code} Server Error from upstream")
+            raise e
+        except Exception as e:
+            print(f"API_ERROR: Request failed - {e}")
+            raise e
 
     def get_events(self, sport_id, date_str):
-        return self._get(f"/sports/{sport_id}/events/{date_str}")
+        """Fetch full snapshot with tight filters to minimize datapoint cost."""
+        return self._get(f"/sports/{sport_id}/events/{date_str}", params={
+            "affiliate_ids": "3,19,23",   # Pinnacle, DraftKings, FanDuel only
+            "market_ids": "1,2,3",        # Moneyline, Spread, Total only
+            "offset": "300",              # 5-min data window alignment
+            "include": "affiliates",
+        })
+
+    def get_markets_delta(self, sport_id, last_id):
+        """Lightweight delta: only returns prices that changed since last_id."""
+        return self._get("/markets/delta", params={
+            "last_id": last_id,
+            "sport_id": sport_id,
+            "market_ids": "1,2,3",
+        })
 
     def get_delta(self, sport_id, last_id):
+        """Legacy event-level delta (fallback)."""
         return self._get(f"/sports/{sport_id}/events/delta", params={"last_id": last_id})
 
 
@@ -207,7 +241,9 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
         }
     """
     markets = event.get("markets") or []
-    if not isinstance(markets, list):
+    if not isinstance(markets, list) or len(markets) == 0:
+        event_id = event.get("event_id", "Unknown")
+        print(f"PARSER_WARNING: 'markets' missing, empty, or invalid schema for event {event_id}. Upstream schema change?")
         return {}, {}, set(), set()
 
     index: dict[tuple[str, float | None], dict[str, list[dict]]] = {}
@@ -226,8 +262,11 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
 
         market_id = m.get("market_id")
         m_name = (m.get("name") or "").lower()
+        if "3-way" in m_name:
+            continue
+
         participants = m.get("participants") or []
-        if not isinstance(participants, list) or len(participants) == 0:
+        if not isinstance(participants, list) or len(participants) == 0 or len(participants) > 2:
             continue
 
         # Determine market kind
@@ -272,6 +311,8 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                 line_value: float | None = None
                 if is_totals or is_spread:
                     val = line.get("value")
+                    if val is None:
+                        val = line.get("point")
                     try:
                         line_value = float(val)
                     except (TypeError, ValueError):
@@ -287,19 +328,39 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                     except (ValueError, TypeError):
                         continue
                     raw_book_ids_seen.add(book_id)
-                    if RESTRICT_BOOKS and book_id not in ALLOWED_BOOK_IDS:
+                    book_name_raw = KNOWN_BOOKS.get(book_id, f"Book{book_id}")
+
+                    if RESTRICT_BOOKS and book_name_raw.lower().replace(" ", "") not in ALLOWED_BOOK_NAMES:
                         continue
                     if not isinstance(price_obj, dict):
                         continue
 
-                    price_am = price_obj.get("price")
-                    if price_am in (None, 0, "0"):
+                    # Skip closed/delisted lines
+                    if price_obj.get("closed_at"):
                         continue
+
+                    price_am = price_obj.get("price")
+                    # Reject sentinel value 0.0001 (means line is suspended)
+                    if price_am == 0.0001 or price_am == "0.0001":
+                        continue
+                    if price_am in (None, 0, "0", ""):
+                        # Fallback for EU-only or missing American odds formats
+                        price_eu = price_obj.get("price_eu") or price_obj.get("decimal")
+                        if price_eu:
+                            price_am = price_eu
+                        else:
+                            continue
                     dec = to_decimal(price_am)
                     if dec <= 1.0:
                         continue
+                        
+                    try:
+                        pam_float = float(price_am)
+                        # Display integer American odds if >=100, else fallback to float for Decimals
+                        pam_disp = int(pam_float) if (pam_float <= -100 or pam_float >= 100) else pam_float
+                    except Exception:
+                        pam_disp = price_am
 
-                    book_name = KNOWN_BOOKS.get(book_id, f"Book{book_id}")
                     updated_at = price_obj.get("updated_at")
                     used_book_ids_seen.add(book_id)
 
@@ -308,8 +369,8 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                     per_line = index.setdefault(key, {"home": [], "away": [], "over": [], "under": []})
                     per_line[side_label].append(
                         {
-                            "book": book_name,
-                            "price_am": int(price_am),
+                            "book": book_name_raw,
+                            "price_am": pam_disp,
                             "price_dec": dec,
                             "updated_at": updated_at,
                         }
@@ -322,8 +383,8 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                         if side_label == "home" and line_value < 0:
                             buckets["home_minus"].append(
                                 {
-                                    "book": book_name,
-                                    "price_am": int(price_am),
+                                    "book": book_name_raw,
+                                    "price_am": pam_disp,
                                     "price_dec": dec,
                                     "updated_at": updated_at,
                                 }
@@ -331,12 +392,90 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                         elif side_label == "away" and line_value > 0:
                             buckets["away_plus"].append(
                                 {
-                                    "book": book_name,
-                                    "price_am": int(price_am),
+                                    "book": book_name_raw,
+                                    "price_am": pam_disp,
                                     "price_dec": dec,
                                     "updated_at": updated_at,
                                 }
                             )
+
+    # ── LEGACY FALLBACK: event["lines"] dict keyed by book_id ─────────
+    # TheRundown API also provides a flat structure at event["lines"][book_id]
+    # with keys like "moneyline_home", "spread_home", "total_over", etc.
+    # Some books (notably DraftKings) may have data here that isn't in "markets".
+    legacy_lines = event.get("lines")
+    if isinstance(legacy_lines, dict):
+        _LEGACY_MAP = {
+            "moneyline_home": ("ml", None, "home"),
+            "moneyline_away": ("ml", None, "away"),
+            "spread_home":    ("spread", None, "home"),
+            "spread_away":    ("spread", None, "away"),
+            "total_over":     ("total", None, "over"),
+            "total_under":    ("total", None, "under"),
+        }
+        for raw_book_id_str, book_data in legacy_lines.items():
+            try:
+                book_id = int(raw_book_id_str)
+            except (ValueError, TypeError):
+                continue
+            raw_book_ids_seen.add(book_id)
+            book_name_raw = KNOWN_BOOKS.get(book_id, f"Book{book_id}")
+
+            if RESTRICT_BOOKS and book_name_raw.lower().replace(" ", "") not in ALLOWED_BOOK_NAMES:
+                continue
+            if not isinstance(book_data, dict):
+                continue
+
+            for legacy_key, (kind, _placeholder_lv, side_label) in _LEGACY_MAP.items():
+                obj = book_data.get(legacy_key)
+                if not isinstance(obj, dict):
+                    continue
+
+                price_am = obj.get("price") or obj.get("odds")
+                if price_am in (None, 0, "0", ""):
+                    price_eu = obj.get("price_eu") or obj.get("decimal")
+                    if not price_eu:
+                        continue
+                    price_am = price_eu
+
+                dec = to_decimal(price_am)
+                if dec <= 1.0:
+                    continue
+
+                try:
+                    pam_float = float(price_am)
+                    pam_disp = int(pam_float) if (pam_float <= -100 or pam_float >= 100) else pam_float
+                except Exception:
+                    pam_disp = price_am
+
+                # For spread/total, try to get the line value
+                line_value: float | None = None
+                if kind in ("spread", "total"):
+                    lv_raw = obj.get("point") or obj.get("value") or obj.get("line")
+                    if lv_raw is not None:
+                        try:
+                            line_value = float(lv_raw)
+                        except (TypeError, ValueError):
+                            pass
+
+                updated_at = obj.get("updated_at")
+                used_book_ids_seen.add(book_id)
+
+                key = (kind, line_value if kind != "ml" else None)
+                per_line = index.setdefault(key, {"home": [], "away": [], "over": [], "under": []})
+
+                # Only add if this book doesn't already have an entry for this side
+                # (avoid duplicating data already captured from the markets structure)
+                already_has = any(e["book"] == book_name_raw for e in per_line[side_label])
+                if not already_has:
+                    per_line[side_label].append(
+                        {
+                            "book": book_name_raw,
+                            "price_am": pam_disp,
+                            "price_dec": dec,
+                            "updated_at": updated_at,
+                        }
+                    )
 
     return index, spread_pairs, raw_book_ids_seen, used_book_ids_seen
 
@@ -344,10 +483,10 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
 # ──────────────────────────────────────────────
 # ARBITRAGE CORE
 # ──────────────────────────────────────────────
-def analyze_event(event: dict, sport_name: str) -> list:
+def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]:
     """
     Find all near-arb and arb situations for an event.
-    Returns list of comparison dicts sorted by profit descending.
+    Returns (list_of_arbs, list_of_raw_lines).
     """
     # Prefer explicit home/away flags from event["teams"], fall back to teams_normalized.
     teams = event.get("teams") or []
@@ -364,7 +503,7 @@ def analyze_event(event: dict, sport_name: str) -> list:
 
     market_index, spread_pairs, raw_book_ids, used_book_ids = build_market_index(event)
     if not market_index:
-        return []
+        return [], []
 
     if DEBUG_BOOK_COVERAGE:
         missing = []
@@ -377,6 +516,7 @@ def analyze_event(event: dict, sport_name: str) -> list:
             print(f"  ⚠ [{sport_name}] {game} missing raw books: {', '.join(missing)} (raw seen: {raw_names})")
 
     results: list[dict] = []
+    raw_lines: list[dict] = []
 
     # Helper to parse updated_at into UTC datetime
     def _parse_ts(val):
@@ -405,6 +545,20 @@ def analyze_event(event: dict, sport_name: str) -> list:
         else:
             continue
 
+        # Build raw lines for all sides and all books
+        for side_key, side_display in [(side_a_key, side_a_key.capitalize()), (side_b_key, side_b_key.capitalize())]:
+            for option in sides.get(side_key) or []:
+                raw_lines.append({
+                    "sport": sport_name,
+                    "game": game,
+                    "market_kind": kind,
+                    "line_label": market_line_label,
+                    "side": side_display,
+                    "book": option["book"],
+                    "odds_am": option["price_am"],
+                    "updated_at": option.get("updated_at"),
+                })
+
         side_a_list = sides.get(side_a_key) or []
         side_b_list = sides.get(side_b_key) or []
         if not side_a_list or not side_b_list:
@@ -413,6 +567,17 @@ def analyze_event(event: dict, sport_name: str) -> list:
         # Best prices per side (highest decimal odds) across all books at this exact line
         best_a = max(side_a_list, key=lambda e: e["price_dec"])
         best_b = max(side_b_list, key=lambda e: e["price_dec"])
+
+        # Reject arbs where either leg has stale updated_at
+        ts_a = _parse_ts(best_a.get("updated_at"))
+        ts_b = _parse_ts(best_b.get("updated_at"))
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if ts_a and (now_utc - ts_a).total_seconds() > ARB_MAX_LINE_AGE_S:
+            continue
+        if ts_b and (now_utc - ts_b).total_seconds() > ARB_MAX_LINE_AGE_S:
+            continue
+        if ts_a is None or ts_b is None:
+            continue  # no timestamp → can't verify freshness
 
         dec_a = best_a["price_dec"]
         dec_b = best_b["price_dec"]
@@ -477,11 +642,36 @@ def analyze_event(event: dict, sport_name: str) -> list:
     for abs_lv, buckets in spread_pairs.items():
         home_minus = buckets.get("home_minus") or []
         away_plus  = buckets.get("away_plus") or []
+
+        for side_key, line_list, side_display in [("home", home_minus, "Home"), ("away", away_plus, "Away")]:
+            for option in line_list:
+                raw_lines.append({
+                    "sport": sport_name,
+                    "game": game,
+                    "market_kind": "spread",
+                    "line_label": f"{abs_lv:g}",
+                    "side": side_display,
+                    "book": option["book"],
+                    "odds_am": option["price_am"],
+                    "updated_at": option.get("updated_at"),
+                })
+
         if not home_minus or not away_plus:
             continue
 
         best_home = max(home_minus, key=lambda e: e["price_dec"])
         best_away = max(away_plus,  key=lambda e: e["price_dec"])
+
+        # Reject arbs where either leg has stale updated_at
+        ts_home = _parse_ts(best_home.get("updated_at"))
+        ts_away = _parse_ts(best_away.get("updated_at"))
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if ts_home and (now_utc - ts_home).total_seconds() > ARB_MAX_LINE_AGE_S:
+            continue
+        if ts_away and (now_utc - ts_away).total_seconds() > ARB_MAX_LINE_AGE_S:
+            continue
+        if ts_home is None or ts_away is None:
+            continue
 
         dec_home = best_home["price_dec"]
         dec_away = best_away["price_dec"]
@@ -542,7 +732,8 @@ def analyze_event(event: dict, sport_name: str) -> list:
             }
         )
 
-    return results
+    print(f"PARSER_SUCCESS: Scanned {len(raw_lines)} lines for game [{game}] ({sport_name}) without schema errors.")
+    return results, raw_lines
 
 
 # ──────────────────────────────────────────────
@@ -765,18 +956,20 @@ def main():
         return kept
 
     def _analyze_events(filtered, sname):
-        """Run analyze_event on a list of filtered events. Returns (arbs, books)."""
+        """Run analyze_event on a list of filtered events."""
         arbs = []
+        lines = []
         bks  = set()
         for event in filtered:
             if VALIDATION_MODE and not structure_dumped:
                 inspect_raw_structure(event, sname)
-            results = analyze_event(event, sname)
+            results, r_lines = analyze_event(event, sname)
             for r in results:
                 bks.add(r["book_a"])
                 bks.add(r["book_b"])
             arbs.extend(results)
-        return arbs, bks
+            lines.extend(r_lines)
+        return arbs, lines, bks
 
     for sport_id in SPORT_IDS:
         if daily_exhausted:
@@ -790,7 +983,7 @@ def main():
             break
 
         filtered_today = _filter_live(raw_today)
-        arbs_today, books_today = _analyze_events(filtered_today, sname)
+        arbs_today, lines_today, books_today = _analyze_events(filtered_today, sname)
 
         if arbs_today:
             sport_counts[sport_id] = (sname, len(filtered_today))
@@ -806,7 +999,7 @@ def main():
                     daily_exhausted = True
                     break
                 filtered_tmrw = _filter_live(raw_tmrw)
-                arbs_tmrw, books_tmrw = _analyze_events(filtered_tmrw, sname)
+                arbs_tmrw, lines_tmrw, books_tmrw = _analyze_events(filtered_tmrw, sname)
                 sport_counts[sport_id] = (sname, len(filtered_tmrw))
                 total_events += len(filtered_tmrw)
                 books_seen.update(books_tmrw)

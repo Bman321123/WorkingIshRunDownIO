@@ -23,3 +23,13 @@ export type Arb = {
   stale_age_s?: number | null;
 };
 
+export type RawLine = {
+  sport: string;
+  game: string;
+  market_kind: "ml" | "spread" | "total" | string;
+  line_label?: string;
+  side: string;
+  book: string;
+  odds_am: number;
+  updated_at?: string | number | null;
+};

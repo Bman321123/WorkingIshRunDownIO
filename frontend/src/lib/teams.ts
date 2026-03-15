@@ -1,7 +1,7 @@
-type League = "NBA";
+type League = "NBA" | "NHL" | "NFL" | "MLB" | "NCAAB" | "NCAAF" | "MMA" | "NCAAWB" | string;
 
-// ESPN team IDs (NBA). Extend as needed.
-const NBA_TEAM_ID_BY_NAME: Record<string, string> = {
+// ESPN team IDs (NBA).
+const NBA_TEAM_ID: Record<string, string> = {
   "atlanta hawks": "1",
   "boston celtics": "2",
   "brooklyn nets": "17",
@@ -36,6 +36,45 @@ const NBA_TEAM_ID_BY_NAME: Record<string, string> = {
   "washington wizards": "27",
 };
 
+// ESPN team abbreviations (NHL).
+const NHL_TEAM_ABBREV: Record<string, string> = {
+  "anaheim ducks": "ANA",
+  "arizona coyotes": "ARI",
+  "utah hockey club": "UTA",
+  "utah mammoth": "UTA",
+  "boston bruins": "BOS",
+  "buffalo sabres": "BUF",
+  "calgary flames": "CGY",
+  "carolina hurricanes": "CAR",
+  "chicago blackhawks": "CHI",
+  "colorado avalanche": "COL",
+  "columbus blue jackets": "CBJ",
+  "dallas stars": "DAL",
+  "detroit red wings": "DET",
+  "edmonton oilers": "EDM",
+  "florida panthers": "FLA",
+  "los angeles kings": "LA",
+  "minnesota wild": "MIN",
+  "montreal canadiens": "MTL",
+  "nashville predators": "NSH",
+  "new jersey devils": "NJ",
+  "new york islanders": "NYI",
+  "new york rangers": "NYR",
+  "ottawa senators": "OTT",
+  "philadelphia flyers": "PHI",
+  "pittsburgh penguins": "PIT",
+  "san jose sharks": "SJ",
+  "seattle kraken": "SEA",
+  "st. louis blues": "STL",
+  "st louis blues": "STL",
+  "tampa bay lightning": "TB",
+  "toronto maple leafs": "TOR",
+  "vancouver canucks": "VAN",
+  "vegas golden knights": "VGK",
+  "washington capitals": "WSH",
+  "winnipeg jets": "WPG",
+};
+
 function normalizeTeamName(name: string): string {
   return (name || "")
     .toLowerCase()
@@ -50,11 +89,22 @@ export function parseMatchup(game: string): { away: string; home: string } {
   return { away: game || "Away", home: "Home" };
 }
 
-export function espnTeamLogoUrl(league: League, teamName: string): string | null {
-  if (league !== "NBA") return null;
-  const id = NBA_TEAM_ID_BY_NAME[normalizeTeamName(teamName)];
-  if (!id) return null;
-  return `https://a.espncdn.com/i/teamlogos/nba/500/${id}.png`;
+export function espnTeamLogoUrl(league: string, teamName: string): string | null {
+  const norm = normalizeTeamName(teamName);
+
+  if (league === "NBA") {
+    const id = NBA_TEAM_ID[norm];
+    if (!id) return null;
+    return `https://a.espncdn.com/i/teamlogos/nba/500/${id}.png`;
+  }
+
+  if (league === "NHL") {
+    const abbrev = NHL_TEAM_ABBREV[norm];
+    if (!abbrev) return null;
+    return `https://a.espncdn.com/i/teamlogos/nhl/500/${abbrev.toLowerCase()}.png`;
+  }
+
+  return null;
 }
 
 export function initials(name: string): string {
@@ -62,4 +112,3 @@ export function initials(name: string): string {
   const letters = words.slice(0, 2).map((w) => w[0]?.toUpperCase());
   return letters.join("") || "?";
 }
-

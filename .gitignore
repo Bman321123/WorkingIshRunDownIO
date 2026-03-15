@@ -3,4 +3,21 @@ __pycache__/
 *.pyc
 frontend/node_modules/
 node_modules/
+frontend/.next/
+frontend/out/
+
+# GSD
+.planning/
+.gemini/
+.gsd-local-patches/
+
+# Diagnostic / Temp files
+diagnostic_*.md
+debug_*.json
+test_*.py
+verify_*.py
+progress.txt
+ralph_tmp/
+.agents/
+.gsd-repo/
 

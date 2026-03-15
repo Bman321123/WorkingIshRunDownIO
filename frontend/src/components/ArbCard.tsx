@@ -2,6 +2,7 @@ import Image from "next/image";
 import type { Arb } from "@/lib/types";
 import { bookLogoPath } from "@/lib/books";
 import { espnTeamLogoUrl, initials, parseMatchup } from "@/lib/teams";
+import { buildDeepLink } from "@/lib/deeplinks";
 
 function formatProfit(p: number): string {
   const sign = p > 0 ? "+" : "";
@@ -15,8 +16,9 @@ function formatOddsAm(o: number): string {
 
 export function ArbCard({ arb }: { arb: Arb }) {
   const { away, home } = parseMatchup(arb.game);
-  const awayLogo = espnTeamLogoUrl("NBA", away);
-  const homeLogo = espnTeamLogoUrl("NBA", home);
+  const league = arb.sport || "NBA";
+  const awayLogo = espnTeamLogoUrl(league, away);
+  const homeLogo = espnTeamLogoUrl(league, home);
 
   return (
     <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 shadow-card">
@@ -86,6 +88,7 @@ export function ArbCard({ arb }: { arb: Arb }) {
             book={arb.book_a}
             odds={arb.odds_a_am}
             stake={arb.stake_a}
+            game={arb.game}
           />
           <LegBlock
             label="Leg B"
@@ -93,6 +96,7 @@ export function ArbCard({ arb }: { arb: Arb }) {
             book={arb.book_b}
             odds={arb.odds_b_am}
             stake={arb.stake_b}
+            game={arb.game}
             danger={arb.same_book === true}
           />
         </div>
@@ -113,9 +117,13 @@ function LegBlock(props: {
   book: string;
   odds: number;
   stake: number;
+  game: string;
   danger?: boolean;
 }) {
   const logo = bookLogoPath(props.book);
+  const { home } = parseMatchup(props.game);
+  const deepLink = buildDeepLink(props.book, home);
+
   return (
     <div
       className={[
@@ -127,14 +135,33 @@ function LegBlock(props: {
         <div>
           <div className="text-xs font-semibold text-zinc-400">{props.label}</div>
           <div className="mt-0.5 text-sm font-semibold text-zinc-100">{props.side}</div>
-          <div className="mt-1 text-xs text-zinc-400">{props.book}</div>
+          <a
+            href={deepLink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-1 inline-flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 transition group"
+          >
+            {props.book}
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 16 16"
+              fill="currentColor"
+              className="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity"
+            >
+              <path
+                fillRule="evenodd"
+                d="M4.22 11.78a.75.75 0 0 1 0-1.06L9.44 5.5H5.75a.75.75 0 0 1 0-1.5h5.5a.75.75 0 0 1 .75.75v5.5a.75.75 0 0 1-1.5 0V6.56l-5.22 5.22a.75.75 0 0 1-1.06 0Z"
+                clipRule="evenodd"
+              />
+            </svg>
+          </a>
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className="relative h-8 w-8 overflow-hidden rounded-md bg-zinc-900">
+        <a href={deepLink} target="_blank" rel="noopener noreferrer">
+          <div className="relative h-8 w-8 overflow-hidden rounded-md bg-zinc-900 hover:ring-2 hover:ring-emerald-500/50 transition">
             <Image src={logo} alt={props.book} fill sizes="32px" />
           </div>
-        </div>
+        </a>
       </div>
 
       <div className="mt-3 flex items-end justify-between">
@@ -149,4 +176,3 @@ function LegBlock(props: {
     </div>
   );
 }
-

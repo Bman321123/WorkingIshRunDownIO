@@ -1,21 +1,42 @@
 import asyncio
 import json
 import time
+import threading
 from typing import Any
+from datetime import datetime, timezone
 
 from aiohttp import web
 
 import therundown
 
+# ──────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────
 ENABLE_AUTO_SCAN: bool = False
+DELTA_POLL_INTERVAL: int = 10  # seconds between delta polls
+SNAPSHOT_MAX_AGE: int = 300    # 5 min — re-bootstrap snapshot if older
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        resp = web.Response()
+    else:
+        try:
+            resp = await handler(request)
+        except web.HTTPException as ex:
+            resp = ex
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
 def _serialize(obj: Any) -> Any:
-    # Convert datetimes (fresh_ts/stale_ts) to ISO strings for JSON.
     if hasattr(obj, "isoformat"):
         try:
             return obj.isoformat()
@@ -24,79 +45,189 @@ def _serialize(obj: Any) -> Any:
     return obj
 
 
-def scan_arbs_once(sport_ids: list[int]) -> list[dict]:
+# ──────────────────────────────────────────────
+# IN-MEMORY EVENT STORE
+# Maintains the latest state of all events per sport,
+# updated by both snapshot and delta calls.
+# ──────────────────────────────────────────────
+class EventStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        # sport_id -> { event_id -> event_dict }
+        self.events: dict[int, dict[str, dict]] = {}
+        # sport_id -> delta cursor string
+        self.cursors: dict[int, str] = {}
+        # sport_id -> timestamp of last snapshot
+        self.snapshot_ts: dict[int, float] = {}
+        # Timestamp of the most recent successfully fetched data
+        self.last_update_ts: float = 0.0
+        # Datapoint budget tracking
+        self.dp_remaining: str = "?"
+
+    def set_snapshot(self, sport_id: int, events: list[dict], cursor: str | None):
+        with self._lock:
+            by_id = {}
+            for e in events:
+                eid = e.get("event_id")
+                if eid:
+                    by_id[eid] = e
+            self.events[sport_id] = by_id
+            if cursor:
+                self.cursors[sport_id] = cursor
+            self.snapshot_ts[sport_id] = time.time()
+            self.last_update_ts = time.time()
+
+    def merge_delta_events(self, sport_id: int, delta_events: list[dict], new_cursor: str | None):
+        """Merge event-level delta updates."""
+        with self._lock:
+            store = self.events.setdefault(sport_id, {})
+            for de in delta_events:
+                eid = de.get("event_id")
+                if eid:
+                    store[eid] = de
+            if new_cursor:
+                self.cursors[sport_id] = new_cursor
+            self.last_update_ts = time.time()
+
+    def get_events(self, sport_id: int) -> list[dict]:
+        with self._lock:
+            return list(self.events.get(sport_id, {}).values())
+
+    def needs_bootstrap(self, sport_id: int) -> bool:
+        ts = self.snapshot_ts.get(sport_id, 0)
+        return (time.time() - ts) > SNAPSHOT_MAX_AGE
+
+    def freshest_update_age(self) -> float:
+        """Seconds since last successful data update."""
+        if self.last_update_ts == 0:
+            return float("inf")
+        return time.time() - self.last_update_ts
+
+
+_STORE = EventStore()
+
+
+# ──────────────────────────────────────────────
+# SCAN: SNAPSHOT + ANALYZE
+# ──────────────────────────────────────────────
+def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict]]:
     """
-    Minimal wrapper around existing logic.
-    Does NOT change therundown's extraction/arb math; it just runs it and returns results.
+    Fetch fresh events (snapshot + delta merge), then run arbitrage analysis.
+    Returns (arbs, raw_lines).
     """
-    # Ensure affiliate names are populated (best-effort).
+    # Ensure affiliate names include the fallback
     fresh = therundown.fetch_affiliates()
     if fresh:
-        therundown.KNOWN_BOOKS = fresh
+        merged = dict(therundown._KNOWN_BOOKS_FALLBACK)
+        merged.update(fresh)
+        therundown.KNOWN_BOOKS = merged
 
     client = therundown.RundownClient(therundown.API_KEY, therundown.USE_RAPIDAPI)
-    dates = [
-        (therundown.datetime.date.today() + therundown.datetime.timedelta(days=d)).strftime("%Y-%m-%d")
-        for d in range(therundown.DAYS_AHEAD + 1)
-    ]
-
-    all_results: list[dict] = []
-
-    def fetch_events(date_str: str, sport_id: int) -> list[dict]:
-        data = client.get_events(sport_id, date_str)
-        return (data or {}).get("events") or []
-
-    def filter_live(events: list[dict]) -> list[dict]:
-        if not therundown.LIVE_ONLY:
-            return events
-        now_utc = therundown.datetime.datetime.now(therundown.datetime.timezone.utc)
-        kept = []
-        for event in events:
-            status = (event.get("score") or {}).get("event_status")
-            if isinstance(status, str) and status.lower() in {"final", "complete", "closed"}:
-                continue
-            start_raw = event.get("event_date") or event.get("event_date_start")
-            try:
-                if not start_raw:
-                    continue
-                start_dt = therundown.datetime.datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
-                if start_dt.tzinfo is None:
-                    start_dt = start_dt.replace(tzinfo=therundown.datetime.timezone.utc)
-                delta_min = (now_utc - start_dt).total_seconds() / 60.0
-                if delta_min <= therundown.PRE_GAME_MINUTES:
-                    kept.append(event)
-            except Exception:
-                continue
-        return kept
+    today = therundown.datetime.date.today().strftime("%Y-%m-%d")
 
     for sport_id in sport_ids:
-        # Try today first, fallback to tomorrow if no arbs
-        raw_today = fetch_events(dates[0], sport_id)
-        filtered_today = filter_live(raw_today)
-        arbs_today: list[dict] = []
-        for evt in filtered_today:
-            arbs_today.extend(therundown.analyze_event(evt, therundown.ALL_SPORTS.get(sport_id, str(sport_id))))
-        if arbs_today:
-            all_results.extend(arbs_today)
-            continue
+        # Only fetch a fresh snapshot if the store is stale or empty
+        if _STORE.needs_bootstrap(sport_id):
+            try:
+                data = client.get_events(sport_id, today)
+                events = (data or {}).get("events") or []
+                cursor = (data or {}).get("meta", {}).get("delta_last_id")
+                _STORE.set_snapshot(sport_id, events, cursor)
+                _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
+                print(f"  SNAPSHOT :: sport {sport_id} loaded {len(events)} events (cursor={str(cursor)[:12]}…)")
+                time.sleep(1.2)
+            except Exception as e:
+                print(f"  SNAPSHOT :: sport {sport_id} failed: {e}")
+                time.sleep(1.2)
+        else:
+            age = int(time.time() - _STORE.snapshot_ts.get(sport_id, 0))
+            print(f"  SNAPSHOT :: sport {sport_id} using cached data ({age}s old, max {SNAPSHOT_MAX_AGE}s)")
 
-        if len(dates) > 1:
-            raw_tmrw = fetch_events(dates[1], sport_id)
-            filtered_tmrw = filter_live(raw_tmrw)
-            for evt in filtered_tmrw:
-                all_results.extend(
-                    therundown.analyze_event(evt, therundown.ALL_SPORTS.get(sport_id, str(sport_id)))
-                )
+        # Try a delta poll to get any recent changes
+        cursor = _STORE.cursors.get(sport_id)
+        if cursor:
+            try:
+                delta_data = client.get_markets_delta(sport_id, cursor)
+                deltas = (delta_data or {}).get("deltas") or []
+                new_cursor = (delta_data or {}).get("meta", {}).get("delta_last_id", cursor)
+                _STORE.cursors[sport_id] = new_cursor
+                _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
 
-    # Only true arbs (profit > 0) should already be enforced by ARB_THRESHOLD=0.0.
-    # Keep profit desc ordering here so frontend gets already-ranked data.
+                if deltas:
+                    print(f"  DELTA :: sport {sport_id} got {len(deltas)} price changes (cursor → {str(new_cursor)[:12]}…)")
+                    # Markets delta returns individual price changes, not full events.
+                    # We need to re-fetch the full snapshot to get the merged state.
+                    # But we can update the cursor so the next snapshot is fresher.
+                else:
+                    print(f"  DELTA :: sport {sport_id} no changes (cursor → {str(new_cursor)[:12]}…)")
+                time.sleep(1.2)
+            except Exception as e:
+                print(f"  DELTA :: sport {sport_id} failed ({e}), cursor may be stale — will re-bootstrap next scan")
+                _STORE.snapshot_ts[sport_id] = 0  # Force re-bootstrap
+                time.sleep(1.2)
+
+    # Analyze all events in the store
+    all_results: list[dict] = []
+    all_raw_lines: list[dict] = []
+
+    for sport_id in sport_ids:
+        events = _STORE.get_events(sport_id)
+        sport_name = therundown.ALL_SPORTS.get(sport_id, str(sport_id))
+
+        # Filter out finished games AND games that have already started
+        now_utc = datetime.now(timezone.utc)
+        active_events = []
+        for evt in events:
+            # Skip completed games
+            status = (evt.get("score") or {}).get("event_status", "")
+            if isinstance(status, str) and status.lower() in {"final", "complete", "closed", "in_progress", "in progress"}:
+                continue
+
+            # Skip games that started more than 15 min ago (odds are unreliable)
+            start_raw = evt.get("event_date") or evt.get("event_date_start")
+            if start_raw:
+                try:
+                    start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=timezone.utc)
+                    mins_since_start = (now_utc - start_dt).total_seconds() / 60.0
+                    if mins_since_start > 15:
+                        continue  # Game already underway, odds are stale
+                except Exception:
+                    pass
+
+            active_events.append(evt)
+
+        if len(events) != len(active_events):
+            print(f"  FILTER :: {sport_name}: {len(events)} total → {len(active_events)} active (dropped {len(events) - len(active_events)} started/finished)")
+
+        books_in_batch: set[str] = set()
+        for evt in active_events:
+            new_arbs, new_lines = therundown.analyze_event(evt, sport_name)
+            for line in new_lines:
+                books_in_batch.add(line["book"].lower())
+                print(f"     RAW LINE :: [{line['sport']}] {line['game']} | {line['book']} | {line['market_kind'].upper()} {line.get('line_label','')} {line['side']} ({line['odds_am']})")
+            all_results.extend(new_arbs)
+            all_raw_lines.extend(new_lines)
+
+        if active_events and "pinnacle" not in books_in_batch:
+            print(f"  ⚠ PINNACLE NOT FOUND in {sport_name} ({len(active_events)} events)")
+
     all_results.sort(key=lambda r: float(r.get("profit", 0.0)), reverse=True)
-    return all_results
+
+    data_age = _STORE.freshest_update_age()
+    print(f"  ── Scan complete: {len(all_results)} arbs, {len(all_raw_lines)} lines, data age: {int(data_age)}s, dp_remaining: {_STORE.dp_remaining}")
+
+    return all_results, all_raw_lines
 
 
+# ──────────────────────────────────────────────
+# STATE + HANDLERS
+# ──────────────────────────────────────────────
 class ArbState:
     def __init__(self):
         self.arbs: list[dict] = []
+        self.lines: list[dict] = []
         self.last_scan_ms: int | None = None
         self.last_error: str | None = None
         self.last_scan_sports: list[str] = []
@@ -104,23 +235,25 @@ class ArbState:
 
 async def handle_health(request: web.Request) -> web.Response:
     state: ArbState = request.app["state"]
-    return web.json_response(
-        {
-            "ok": True,
-            "lastScanMs": state.last_scan_ms,
-            "sports": state.last_scan_sports,
-            "count": len(state.arbs),
-            "error": state.last_error,
-        }
-    )
+    return web.json_response({
+        "ok": True,
+        "lastScanMs": state.last_scan_ms,
+        "sports": state.last_scan_sports,
+        "count": len(state.arbs),
+        "error": state.last_error,
+        "dataAge": int(_STORE.freshest_update_age()),
+        "dpRemaining": _STORE.dp_remaining,
+    })
 
 
 async def handle_arbs(request: web.Request) -> web.Response:
     state: ArbState = request.app["state"]
-    # Add CORS header for local dev.
-    resp = web.json_response(state.arbs, dumps=lambda x: json.dumps(x, default=_serialize))
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    return resp
+    return web.json_response({
+        "arbs": state.arbs,
+        "lines": state.lines,
+        "dataAge": int(_STORE.freshest_update_age()),
+        "dpRemaining": _STORE.dp_remaining,
+    }, dumps=lambda x: json.dumps(x, default=_serialize))
 
 
 def _sport_name_by_id() -> dict[int, str]:
@@ -128,7 +261,6 @@ def _sport_name_by_id() -> dict[int, str]:
 
 
 def _sport_id_by_name() -> dict[str, int]:
-    # Accept exact labels from therundown.ALL_SPORTS (e.g. "NBA") case-insensitive.
     out: dict[str, int] = {}
     for sid, name in _sport_name_by_id().items():
         out[name.lower()] = sid
@@ -165,11 +297,11 @@ async def handle_scan_now(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # One-time scan (blocking scan runs in thread to avoid blocking event loop).
     try:
         state.last_error = None
-        arbs = await asyncio.to_thread(scan_arbs_once, selected_ids)
+        arbs, lines = await asyncio.to_thread(scan_arbs_once, selected_ids)
         state.arbs = arbs
+        state.lines = lines
         state.last_scan_ms = _now_ms()
         state.last_scan_sports = selected_names
         resp = web.json_response(
@@ -179,6 +311,9 @@ async def handle_scan_now(request: web.Request) -> web.Response:
                 "lastScanMs": state.last_scan_ms,
                 "count": len(state.arbs),
                 "arbs": state.arbs,
+                "lines": state.lines,
+                "dataAge": int(_STORE.freshest_update_age()),
+                "dpRemaining": _STORE.dp_remaining,
             },
             dumps=lambda x: json.dumps(x, default=_serialize),
         )
@@ -186,7 +321,6 @@ async def handle_scan_now(request: web.Request) -> web.Response:
         state.last_error = str(e)
         resp = web.json_response({"ok": False, "error": state.last_error}, status=500)
 
-    resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
 
@@ -198,7 +332,9 @@ async def scan_loop(app: web.Application):
     while True:
         try:
             state.last_error = None
-            state.arbs = scan_arbs_once(sport_ids)
+            arbs, lines = scan_arbs_once(sport_ids)
+            state.arbs = arbs
+            state.lines = lines
             state.last_scan_ms = _now_ms()
             state.last_scan_sports = [_sport_name_by_id().get(sid, str(sid)) for sid in sport_ids]
         except Exception as e:
@@ -207,7 +343,7 @@ async def scan_loop(app: web.Application):
 
 
 def create_app(sport_ids: list[int], interval_s: float) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app["state"] = ArbState()
     app["sport_ids"] = sport_ids
     app["interval_s"] = interval_s
@@ -235,7 +371,13 @@ def create_app(sport_ids: list[int], interval_s: float) -> web.Application:
 
 
 if __name__ == "__main__":
-    # Default: NBA only, scan every 5 seconds.
-    app = create_app(sport_ids=[4], interval_s=5.0)
-    web.run_app(app, host="0.0.0.0", port=8080)
-
+    import sys
+    import traceback
+    print("Initialize Server: Checking port binding on 0.0.0.0:3030...")
+    try:
+        app = create_app(sport_ids=[4], interval_s=5.0)
+        web.run_app(app, host="0.0.0.0", port=3030)
+    except Exception as e:
+        print(f"FATAL STARTUP ERROR: {e}")
+        traceback.print_exc()
+        sys.exit(1)

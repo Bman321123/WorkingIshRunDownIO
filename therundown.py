@@ -35,7 +35,9 @@ SHOW_NEAR_ARBS:   bool = False  # when False, hide near-arb section in output
 
 # Book restriction (use only these books when enabled)
 RESTRICT_BOOKS: bool = True
-ALLOWED_BOOK_NAMES: set[str] = {"pinnacle", "draftkings", "fanduel"}
+ALLOWED_BOOK_NAMES: set[str] = {"betmgm", "draftkings", "fanduel"}
+# Primary book for API fetch and coverage checks (BetMGM = 22 per TheRundown docs)
+PRIMARY_BOOK_ID: int = 22
 DEBUG_BOOK_COVERAGE: bool = False  # print one-line diagnostics when key books missing
 ARB_MAX_LINE_AGE_S: int = 1800  # 30 min — both arb legs must be updated within this window
 
@@ -56,10 +58,10 @@ ALL_SPORTS = {
 
 SPORT_IDS = [int(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else list(ALL_SPORTS.keys())
 
-# Fallback book IDs if affiliates fetch fails
+# Fallback book IDs if affiliates fetch fails (BetMGM = 22 per TheRundown docs)
 _KNOWN_BOOKS_FALLBACK = {
-    2: "Bovada", 3: "Pinnacle", 4: "Sportsbetting", 6: "BetOnline",
-    11: "Lowvig", 12: "Bodog", 14: "Intertops", 16: "Matchbook",
+    2: "Bovada", 4: "Sportsbetting", 6: "BetOnline",
+    11: "LowVig", 12: "Bodog", 14: "Intertops", 16: "Matchbook",
     18: "YouWager", 19: "Draftkings", 21: "Unibet", 22: "BetMGM",
     23: "Fanduel", 25: "Kalshi", 26: "Polymarket",
 }
@@ -137,9 +139,9 @@ class RundownClient:
     def get_events(self, sport_id, date_str):
         """Fetch full snapshot with tight filters to minimize datapoint cost."""
         return self._get(f"/sports/{sport_id}/events/{date_str}", params={
-            "affiliate_ids": "3,19,23",   # Pinnacle, DraftKings, FanDuel only
-            "market_ids": "1,2,3",        # Moneyline, Spread, Total only
-            "offset": "300",              # 5-min data window alignment
+            "affiliate_ids": "22,19,23",   # BetMGM (22), DraftKings (19), FanDuel (23)
+            "market_ids": "1,2,3",         # Moneyline, Spread, Total only
+            "offset": "300",               # 5-min data window alignment
             "include": "affiliates",
         })
 
@@ -507,8 +509,8 @@ def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]
 
     if DEBUG_BOOK_COVERAGE:
         missing = []
-        if 3 not in raw_book_ids:
-            missing.append("pinnacle")
+        if PRIMARY_BOOK_ID not in raw_book_ids:
+            missing.append(KNOWN_BOOKS.get(PRIMARY_BOOK_ID, "betmgm").lower())
         if 23 not in raw_book_ids:
             missing.append("fanduel")
         if missing:

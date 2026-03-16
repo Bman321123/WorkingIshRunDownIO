@@ -1,6 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <rect x="10" y="10" width="44" height="44" rx="10" fill="#0a0a0a"/>
-  <path d="M18 42V22h10.5c7 0 11.5 3.7 11.5 10s-4.5 10-11.5 10H18Zm8-6h2.8c3.1 0 5.2-1.5 5.2-4s-2.1-4-5.2-4H26v8Z" fill="#f97316"/>
-  <path d="M42 44c2.6 0 4.8-2.2 4.8-4.8S44.6 34.4 42 34.4s-4.8 2.2-4.8 4.8S39.4 44 42 44Z" fill="#22c55e"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+  <rect width="64" height="64" rx="12" fill="#0D0D0D"/>
+  <!-- Crown - DraftKings green #61b510 -->
+  <path d="M16 42V28l8-12 8 12 8-12 8 14v14H16z" fill="#61b510"/>
+  <path d="M32 16l6 12h-4l-2-8-2 8h-4l6-12z" fill="#61b510"/>
+  <!-- Crown jewel - orange #F46C22 -->
+  <circle cx="32" cy="26" r="5" fill="#F46C22"/>
 </svg>
-

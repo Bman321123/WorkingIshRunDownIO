@@ -13,8 +13,8 @@ export function buildDeepLink(bookName: string, teamName: string): string {
       return `https://sportsbook.draftkings.com/search/${q}`;
     case "fanduel":
       return `https://sportsbook.fanduel.com/search?query=${q}`;
-    case "pinnacle":
-      return `https://www.pinnacle.com/en/search/${q}`;
+    case "betmgm":
+      return `https://sports.betmgm.com/en/sports?q=${q}`;
     default:
       return "#";
   }

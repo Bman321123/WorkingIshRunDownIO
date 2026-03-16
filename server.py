@@ -210,8 +210,8 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict]]:
             all_results.extend(new_arbs)
             all_raw_lines.extend(new_lines)
 
-        if active_events and "pinnacle" not in books_in_batch:
-            print(f"  ⚠ PINNACLE NOT FOUND in {sport_name} ({len(active_events)} events)")
+        if active_events and "betmgm" not in books_in_batch:
+            print(f"  ⚠ BETMGM NOT FOUND in {sport_name} ({len(active_events)} events)")
 
     all_results.sort(key=lambda r: float(r.get("profit", 0.0)), reverse=True)
 

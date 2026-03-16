@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+  <rect width="64" height="64" rx="12" fill="#1A1A1A"/>
+  <!-- BetMGM gold #D29F53 - stylized crown / lion motif -->
+  <path d="M32 14L18 38h6l4-12 4 12h6L32 14z" fill="#D29F53"/>
+  <path d="M22 42h20v3H22v-3zm-2 5h24v2H20v-2z" fill="#D29F53"/>
+  <circle cx="32" cy="24" r="6" fill="#B1801E" opacity="0.85"/>
+</svg>

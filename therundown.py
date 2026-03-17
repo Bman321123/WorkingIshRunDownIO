@@ -11,6 +11,8 @@ import sys
 import time
 import datetime
 import json
+import threading
+from functools import wraps
 import requests
 from prettytable import PrettyTable
 
@@ -21,6 +23,18 @@ API_KEY: str = os.getenv(
     "THERUNDOWN_API_KEY",
     "b05e571893ea8db8950f9b6497d480ad7a5547ddcbc5064131a8e3bfe713599d"
 )
+API_KEYS: list[str] = [
+    "10c79a340413a26b827a2d34b0c32e86e7bf5c964eb4d4c3b8e8cadc995d1c58",
+    "b05e571893ea8db8950f9b6497d480ad7a5547ddcbc5064131a8e3bfe713599d",
+    "80cb027743637f401c17b21854a6faad090619935f63369597ac462a1d35d1cc",
+    "e6b5c7622d7411381bfcf2ade1f8776eaa247e22cddcade8ca495062991fac96",
+]
+_ENV_KEYS_RAW = os.getenv("THERUNDOWN_API_KEYS", "").strip()
+if _ENV_KEYS_RAW:
+    _parsed = [k.strip() for k in _ENV_KEYS_RAW.replace(";", ",").split(",")]
+    API_KEYS = [k for k in _parsed if k]
+if API_KEY and API_KEY not in API_KEYS:
+    API_KEYS.insert(0, API_KEY)
 USE_RAPIDAPI:   bool  = False
 TOTAL_STAKE:    float = 100.0
 POLL_INTERVAL:  int   = 60
@@ -37,8 +51,36 @@ SHOW_NEAR_ARBS:   bool = False  # when False, hide near-arb section in output
 # Book restriction (use only these books when enabled)
 RESTRICT_BOOKS: bool = True
 ALLOWED_BOOK_NAMES: set[str] = {"betmgm", "draftkings", "fanduel"}
+# Player props are often unavailable from a strict 3-book subset, so allow
+# broad book coverage for props by default.
+RESTRICT_PROP_BOOKS: bool = os.getenv("RESTRICT_PROP_BOOKS", "0") == "1"
 # Primary book for API fetch and coverage checks (BetMGM = 22 per TheRundown docs)
 PRIMARY_BOOK_ID: int = 22
+PROP_MARKET_IDS: set[int] = {
+    29,   # player points
+    33,   # player turnovers
+    35,   # player rebounds
+    38,   # 3pt made
+    39,   # player assists
+    93,   # player PRA
+    98,   # player blocks
+    99,   # player points + assists
+    297,  # player points + rebounds
+    298,  # player rebounds + assists
+}
+PROP_MARKET_NAMES: dict[int, str] = {
+    29: "player_points",
+    33: "player_turnovers",
+    35: "player_rebounds",
+    38: "player_threes_made",
+    39: "player_assists",
+    93: "player_pra",
+    98: "player_blocks",
+    99: "player_points_assists",
+    297: "player_points_rebounds",
+    298: "player_rebounds_assists",
+}
+CORE_MARKET_IDS: tuple[int, ...] = (1, 2, 3)
 DEBUG_BOOK_COVERAGE: bool = False  # print one-line diagnostics when key books missing
 ARB_MAX_LINE_AGE_S: int = 1800  # 30 min — both arb legs must be updated within this window
 
@@ -50,6 +92,7 @@ MAX_PROFIT_CAP: float = 10.0
 
 # When True, prints extra per-opportunity detail for manual verification
 VALIDATION_MODE: bool = False
+PROP_DIAGNOSTICS: bool = os.getenv("PROP_DIAGNOSTICS", "0") == "1"
 
 ALL_SPORTS = {
     1: "NCAAF", 2: "NFL",    3: "MLB",
@@ -68,6 +111,8 @@ _KNOWN_BOOKS_FALLBACK = {
 }
 
 KNOWN_BOOKS: dict[int, str] = dict(_KNOWN_BOOKS_FALLBACK)
+_PROP_STRUCTURE_LOGGED: set[int] = set()
+_PROP_ZERO_YIELD_LOGGED: set[tuple[str, int]] = set()
 
 
 def fetch_affiliates() -> dict[int, str] | None:
@@ -91,6 +136,112 @@ LINE_TYPES = [
     ("Total",     "total_over",     "total_under"),
 ]
 
+
+class AllKeysExpendedError(Exception):
+    pass
+
+
+class ApiKeyRotationState:
+    """Process-wide API key state with per-key lockouts."""
+
+    def __init__(self, keys: list[str]):
+        clean = [k for k in keys if isinstance(k, str) and k.strip()]
+        if not clean:
+            raise ValueError("No API keys configured for TheRundown")
+        self._keys = clean
+        self._locked_until = [0.0 for _ in clean]
+        self._current_idx = 0
+        self._lock = threading.Lock()
+
+    @property
+    def total(self) -> int:
+        return len(self._keys)
+
+    def _now(self) -> float:
+        return time.time()
+
+    def get_next_available(self) -> tuple[str, int]:
+        """Round-robin pick of a currently available key."""
+        now = self._now()
+        with self._lock:
+            for offset in range(len(self._keys)):
+                idx = (self._current_idx + offset) % len(self._keys)
+                if now >= self._locked_until[idx]:
+                    self._current_idx = idx
+                    return self._keys[idx], idx
+        raise AllKeysExpendedError(self.exhausted_message())
+
+    def lock_key(self, idx: int, retry_seconds: int) -> None:
+        retry_seconds = max(int(retry_seconds), 1)
+        with self._lock:
+            self._locked_until[idx] = self._now() + retry_seconds
+            self._current_idx = (idx + 1) % len(self._keys)
+
+    def min_wait_seconds(self) -> int:
+        now = self._now()
+        with self._lock:
+            waits = [max(0, int(until - now)) for until in self._locked_until]
+        positive = [w for w in waits if w > 0]
+        return min(positive) if positive else 0
+
+    def exhausted_message(self) -> str:
+        wait_s = self.min_wait_seconds()
+        unit = "second" if wait_s == 1 else "seconds"
+        return f"ALL KEYS EXPENDED | NEXT AVAILABLE RUN IN {wait_s} {unit}"
+
+
+_API_KEY_STATE = ApiKeyRotationState(API_KEYS)
+
+
+def _parse_retry_after_seconds(resp_headers: dict) -> int:
+    """Prefer Retry-After header; fallback to 60s."""
+    raw = (
+        resp_headers.get("retry-after")
+        or resp_headers.get("Retry-After")
+        or resp_headers.get("x-retry-after")
+    )
+    try:
+        return max(int(float(raw)), 1)
+    except (TypeError, ValueError):
+        return 60
+
+
+def chunk_market_ids(ids: list[int] | set[int] | tuple[int, ...], chunk_size: int = 12) -> list[list[int]]:
+    """
+    Split market IDs into <= chunk_size lists.
+    V2 /events/{eventID} requests silently ignore IDs beyond 12.
+    """
+    cleaned = sorted({int(i) for i in ids})
+    if chunk_size <= 0:
+        chunk_size = 12
+    return [cleaned[i:i + chunk_size] for i in range(0, len(cleaned), chunk_size)]
+
+
+def with_api_key_rotation(fn):
+    """
+    Decorator for RundownClient request methods.
+    On 429, lock current key by Retry-After and retry with next key.
+    """
+    @wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        attempts = 0
+        seen_idxs: set[int] = set()
+        while attempts < _API_KEY_STATE.total:
+            key, idx = _API_KEY_STATE.get_next_available()
+            self._apply_api_key(key)
+            try:
+                return fn(self, *args, **kwargs)
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                if status != 429:
+                    raise
+                retry_s = _parse_retry_after_seconds(getattr(e.response, "headers", {}) or {})
+                _API_KEY_STATE.lock_key(idx, retry_s)
+                seen_idxs.add(idx)
+                attempts = len(seen_idxs)
+        raise AllKeysExpendedError(_API_KEY_STATE.exhausted_message())
+    return wrapper
+
 # ──────────────────────────────────────────────
 # API CLIENT
 # ──────────────────────────────────────────────
@@ -101,17 +252,25 @@ class RundownClient:
 
     def __init__(self, api_key, use_rapidapi=False):
         self.base_url = self.RAPID_BASE if use_rapidapi else self.DIRECT_BASE
+        self.use_rapidapi = use_rapidapi
         self.last_headers = {}
         self.session  = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
-        if use_rapidapi:
+        self._apply_api_key(api_key)
+
+    def _apply_api_key(self, api_key: str):
+        if self.use_rapidapi:
             self.session.headers.update({
                 "X-RapidAPI-Key": api_key,
                 "X-RapidAPI-Host": self.RAPID_HOST,
             })
+            self.session.headers.pop("X-TheRundown-Key", None)
         else:
             self.session.headers.update({"X-TheRundown-Key": api_key})
+            self.session.headers.pop("X-RapidAPI-Key", None)
+            self.session.headers.pop("X-RapidAPI-Host", None)
 
+    @with_api_key_rotation
     def _get(self, path, params=None):
         url = f"{self.base_url}{path}"
         print(f"API_REQUEST: GET {url} with params {params}")
@@ -139,12 +298,62 @@ class RundownClient:
 
     def get_events(self, sport_id, date_str):
         """Fetch full snapshot with tight filters to minimize datapoint cost."""
+        market_ids = ",".join(str(mid) for mid in CORE_MARKET_IDS)
         return self._get(f"/sports/{sport_id}/events/{date_str}", params={
             "affiliate_ids": "22,19,23",   # BetMGM (22), DraftKings (19), FanDuel (23)
-            "market_ids": "1,2,3",         # Moneyline, Spread, Total only
+            "market_ids": market_ids,
             "offset": "300",               # 5-min data window alignment
             "include": "affiliates",
+            "main_line": "true",
         })
+
+    def get_available_markets_by_date(self, date_str, offset: str = "300"):
+        """
+        Discover available markets for all sports on a date.
+        Response is keyed by sport_id strings.
+        """
+        return self._get(f"/sports/markets/{date_str}", params={"offset": str(offset)})
+
+    def get_prop_events(self, sport_id, date_str):
+        """
+        Fetch props-only event markets without restrictive affiliate filters.
+        This improves prop visibility when a subset of books does not expose
+        player props in the main snapshot.
+        """
+        prop_ids = ",".join(str(mid) for mid in sorted(PROP_MARKET_IDS))
+        return self._get(f"/sports/{sport_id}/events/{date_str}", params={
+            "market_ids": prop_ids,
+            "offset": "300",
+            "include": "affiliates",
+        })
+
+    def get_event_markets_catalog(self, event_ref):
+        """
+        Fetch market catalog for one event (available market IDs and metadata).
+        event_ref may be event_id or event_uuid.
+        """
+        return self._get(f"/events/{event_ref}/markets", params={"offset": "300"})
+
+    def get_event_markets(self, event_ref):
+        """Alias for event market catalog lookup."""
+        return self.get_event_markets_catalog(event_ref)
+
+    def get_event_with_markets(self, event_ref, market_ids=None, affiliate_ids: str | None = None, main_line: str = "false"):
+        """
+        Fetch one event with selected market IDs.
+        event_ref may be event_id or event_uuid.
+        """
+        params = {"offset": "300", "include": "affiliates"}
+        if market_ids:
+            if isinstance(market_ids, (list, set, tuple)):
+                params["market_ids"] = ",".join(str(m) for m in market_ids)
+            else:
+                params["market_ids"] = str(market_ids)
+        if affiliate_ids:
+            params["affiliate_ids"] = str(affiliate_ids)
+        if main_line in {"true", "false"}:
+            params["main_line"] = main_line
+        return self._get(f"/events/{event_ref}", params=params)
 
     def get_markets_delta(self, sport_id, last_id):
         """Lightweight delta: only returns prices that changed since last_id."""
@@ -549,6 +758,347 @@ def _resolve_teams(event: dict) -> tuple[str, str, str]:
         away = tn[1].get("name", "Away") if len(tn) > 1 else "Away"
     game = f"{away} @ {home}"
     return game, home, away
+
+
+def parse_player_props(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]:
+    """
+    Extract player prop lines from a single event.
+    Returns (raw_lines, best_lines).
+    Only processes market_ids in PROP_MARKET_IDS. Silently skips markets with no valid data.
+    """
+    game, _home, _away = _resolve_teams(event)
+    markets = event.get("markets") or []
+    raw_lines: list[dict] = []
+    best_lines: list[dict] = []
+    debug_enabled = VALIDATION_MODE or PROP_DIAGNOSTICS
+    event_diag = {
+        "prop_markets_seen": 0,
+        "lines_considered": 0,
+        "lines_accepted": 0,
+        "unknown_participant_type": 0,
+        "missing_side": 0,
+        "missing_player": 0,
+        "closed": 0,
+        "sentinel_price": 0,
+        "book_filtered": 0,
+        "invalid_odds": 0,
+    }
+
+    def _normalize_player_name_from_side_participant(name: str) -> str:
+        txt = str(name or "").strip()
+        if not txt:
+            return ""
+        low = txt.lower()
+        if low.endswith(" over"):
+            return txt[:-5].strip()
+        if low.endswith(" under"):
+            return txt[:-6].strip()
+        if low.startswith("over "):
+            return txt[5:].strip()
+        if low.startswith("under "):
+            return txt[6:].strip()
+        return txt
+
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+
+        market_id = m.get("market_id")
+        if market_id not in PROP_MARKET_IDS:
+            continue
+        event_diag["prop_markets_seen"] += 1
+        prop_type = PROP_MARKET_NAMES[market_id]
+
+        if market_id not in _PROP_STRUCTURE_LOGGED:
+            _PROP_STRUCTURE_LOGGED.add(market_id)
+            print(f"  [PROP_INSPECT] market_id={market_id} ({prop_type}) sport={sport_name}")
+            for p in (m.get("participants") or [])[:2]:
+                print(f"    participant type={p.get('type')!r} name={p.get('name')!r}")
+                for ln in (p.get("lines") or [])[:1]:
+                    print(
+                        f"    line value={ln.get('value')!r} "
+                        f"line_value_is_participant={ln.get('line_value_is_participant')}"
+                    )
+                    print(f"    prices keys (book ids): {list((ln.get('prices') or {}).keys())[:5]}")
+
+        # Map numeric line thresholds to known player names from TYPE_PLAYER branch.
+        players_by_threshold: dict[float, set[str]] = {}
+        for participant in m.get("participants") or []:
+            if not isinstance(participant, dict):
+                continue
+            if participant.get("type") != "TYPE_PLAYER":
+                continue
+            participant_name = str(participant.get("name") or "").strip()
+            if not participant_name:
+                continue
+            for line in participant.get("lines") or []:
+                if not isinstance(line, dict):
+                    continue
+                if line.get("line_value_is_participant"):
+                    continue
+                val = line.get("value")
+                if val is None:
+                    val = line.get("point")
+                try:
+                    threshold = float(val)
+                except (TypeError, ValueError):
+                    continue
+                players_by_threshold.setdefault(threshold, set()).add(participant_name)
+
+        prop_buckets: dict[tuple[str, float | None], dict[str, list[dict]]] = {}
+        market_lines_accepted = 0
+
+        for participant in m.get("participants") or []:
+            if not isinstance(participant, dict):
+                continue
+            p_type = str(participant.get("type", "") or "")
+            p_type_u = p_type.upper()
+            p_name = str(participant.get("name", "") or "")
+            p_name_l = p_name.lower()
+
+            # Resolve side from participant type first, then fallback by name for TYPE_RESULT.
+            side: str | None = None
+            if p_type_u == "TYPE_OVER":
+                side = "over"
+            elif p_type_u == "TYPE_UNDER":
+                side = "under"
+            elif p_type_u == "TYPE_RESULT":
+                if "over" in p_name_l:
+                    side = "over"
+                elif "under" in p_name_l:
+                    side = "under"
+            elif p_type_u == "TYPE_PLAYER":
+                # TYPE_PLAYER participants are used for player/threshold mapping only.
+                continue
+            else:
+                event_diag["unknown_participant_type"] += 1
+                continue
+            if not side:
+                event_diag["missing_side"] += 1
+                continue
+
+            for line in participant.get("lines") or []:
+                if not isinstance(line, dict):
+                    continue
+                event_diag["lines_considered"] += 1
+
+                player_name: str | None = None
+                line_threshold: float | None = None
+                if line.get("line_value_is_participant"):
+                    line_player = str(line.get("value") or "").strip()
+                    if line_player:
+                        player_name = line_player
+                else:
+                    val = line.get("value")
+                    if val is None:
+                        val = line.get("point")
+                    try:
+                        line_threshold = float(val)
+                    except (TypeError, ValueError):
+                        line_threshold = None
+                    # Side-typed participant names frequently contain player names.
+                    if p_type_u in {"TYPE_OVER", "TYPE_UNDER"}:
+                        candidate_name = _normalize_player_name_from_side_participant(p_name)
+                        if candidate_name:
+                            player_name = candidate_name
+                    elif line_threshold is not None:
+                        candidates = players_by_threshold.get(line_threshold) or set()
+                        if len(candidates) == 1:
+                            player_name = next(iter(candidates))
+                        elif len(candidates) > 1 and p_name:
+                            normalized = _normalize_player_name_from_side_participant(p_name)
+                            if normalized in candidates:
+                                player_name = normalized
+
+                if not player_name:
+                    event_diag["missing_player"] += 1
+                    continue
+
+                bucket_key = (player_name, line_threshold)
+                bucket = prop_buckets.setdefault(bucket_key, {"over": [], "under": []})
+
+                prices = line.get("prices") or {}
+                if not isinstance(prices, dict):
+                    continue
+
+                for raw_book_id, price_obj in prices.items():
+                    if not isinstance(price_obj, dict):
+                        event_diag["invalid_odds"] += 1
+                        continue
+                    # Skip closed/delisted lines
+                    if price_obj.get("closed_at"):
+                        event_diag["closed"] += 1
+                        continue
+
+                    price_am = price_obj.get("price")
+                    # Reject sentinel value 0.0001 (means line is suspended)
+                    if price_am == 0.0001 or price_am == "0.0001":
+                        event_diag["sentinel_price"] += 1
+                        continue
+                    if price_am in (None, 0, "0", ""):
+                        # Fallback for EU-only or missing American odds formats
+                        price_eu = price_obj.get("price_eu") or price_obj.get("decimal")
+                        if price_eu:
+                            price_am = price_eu
+                        else:
+                            event_diag["invalid_odds"] += 1
+                            continue
+                    dec = to_decimal(price_am)
+                    if dec <= 1.0:
+                        event_diag["invalid_odds"] += 1
+                        continue
+
+                    try:
+                        book_id = int(raw_book_id)
+                    except (ValueError, TypeError):
+                        continue
+                    book_name = KNOWN_BOOKS.get(book_id, f"Book{book_id}")
+                    if RESTRICT_PROP_BOOKS and book_name.lower().replace(" ", "") not in ALLOWED_BOOK_NAMES:
+                        event_diag["book_filtered"] += 1
+                        continue
+
+                    try:
+                        pam_float = float(price_am)
+                        pam_disp = int(pam_float) if (pam_float <= -100 or pam_float >= 100) else pam_float
+                    except Exception:
+                        pam_disp = price_am
+
+                    updated_at = price_obj.get("updated_at")
+                    label_prefix = "O" if side == "over" else "U"
+                    line_label = (
+                        f"{label_prefix} {line_threshold:g}" if line_threshold is not None else label_prefix
+                    )
+
+                    raw_lines.append({
+                        "sport": sport_name,
+                        "game": game,
+                        "market_kind": "prop",
+                        "line_label": line_label,
+                        "side": side.capitalize(),
+                        "book": book_name,
+                        "odds_am": pam_disp,
+                        "updated_at": updated_at,
+                        "player": player_name,
+                        "prop_type": prop_type,
+                    })
+
+                    bucket[side].append({
+                        "book": book_name,
+                        "price_am": pam_disp,
+                        "price_dec": dec,
+                        "updated_at": updated_at,
+                    })
+                    event_diag["lines_accepted"] += 1
+                    market_lines_accepted += 1
+
+        warn_key = (sport_name, int(market_id))
+        if market_lines_accepted == 0 and warn_key not in _PROP_ZERO_YIELD_LOGGED:
+            participants = m.get("participants") or []
+            if participants:
+                _PROP_ZERO_YIELD_LOGGED.add(warn_key)
+                participant_types = sorted({str((p or {}).get("type", "")) for p in participants if isinstance(p, dict)})
+                print(
+                    f"  [PROP_WARN] zero accepted lines for market_id={market_id} ({prop_type}) "
+                    f"sport={sport_name} participant_types={participant_types}"
+                )
+
+        for (player_name, line_threshold), sides in prop_buckets.items():
+            best_over = select_best_american_price(sides["over"])
+            best_under = select_best_american_price(sides["under"])
+            if not best_over or not best_under:
+                continue
+            best_lines.append({
+                "type": "prop",
+                "sport": sport_name,
+                "game": game,
+                "player": player_name,
+                "prop_type": prop_type,
+                "line": line_threshold,
+                "over": {"book": best_over["book"], "odds_am": best_over["price_am"]},
+                "under": {"book": best_under["book"], "odds_am": best_under["price_am"]},
+            })
+
+    if debug_enabled and event_diag["prop_markets_seen"] > 0:
+        print(
+            "  [PROP_DIAG] "
+            f"{sport_name} {game} | markets={event_diag['prop_markets_seen']} "
+            f"considered={event_diag['lines_considered']} accepted={event_diag['lines_accepted']} "
+            f"drops: unknown_type={event_diag['unknown_participant_type']} "
+            f"missing_side={event_diag['missing_side']} missing_player={event_diag['missing_player']} "
+            f"closed={event_diag['closed']} sentinel={event_diag['sentinel_price']} "
+            f"book_filtered={event_diag['book_filtered']} invalid_odds={event_diag['invalid_odds']}"
+        )
+
+    return raw_lines, best_lines
+
+
+def diagnose_prop_market_availability(
+    client: "RundownClient",
+    sport_id: int,
+    date_str: str,
+    affiliate_ids: str = "22,19,23",
+) -> dict:
+    """
+    Read-only troubleshooting helper for prop visibility.
+    Compares catalog availability vs event payload market presence.
+    """
+    requested = sorted(PROP_MARKET_IDS)
+    out: dict = {
+        "sport_id": sport_id,
+        "date": date_str,
+        "requested_prop_market_ids": requested,
+        "catalog_prop_ids_present": [],
+        "events_with_affiliates_prop_counts": {},
+        "events_without_affiliates_prop_counts": {},
+    }
+
+    try:
+        catalog = client._get(f"/sports/{sport_id}/markets/{date_str}", params={"offset": "300"}) or {}
+        key = str(sport_id)
+        entries = catalog.get(key) or catalog.get("markets") or []
+        present = sorted(
+            int(e.get("id"))
+            for e in entries
+            if isinstance(e, dict) and e.get("id") in PROP_MARKET_IDS
+        )
+        out["catalog_prop_ids_present"] = present
+    except Exception as e:
+        out["catalog_error"] = str(e)
+
+    def _event_prop_counts(params: dict) -> dict:
+        payload = client._get(f"/sports/{sport_id}/events/{date_str}", params=params) or {}
+        counts: dict[int, int] = {mid: 0 for mid in requested}
+        for evt in payload.get("events") or []:
+            for m in evt.get("markets") or []:
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("market_id")
+                if mid in counts:
+                    counts[mid] += 1
+        return counts
+
+    try:
+        out["events_with_affiliates_prop_counts"] = _event_prop_counts({
+            "affiliate_ids": affiliate_ids,
+            "market_ids": ",".join(str(m) for m in requested),
+            "offset": "300",
+            "include": "affiliates",
+            "main_line": "true",
+        })
+    except Exception as e:
+        out["events_with_affiliates_error"] = str(e)
+
+    try:
+        out["events_without_affiliates_prop_counts"] = _event_prop_counts({
+            "market_ids": ",".join(str(m) for m in requested),
+            "offset": "300",
+            "include": "affiliates",
+            "main_line": "true",
+        })
+    except Exception as e:
+        out["events_without_affiliates_error"] = str(e)
+
+    return out
 
 
 def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]:

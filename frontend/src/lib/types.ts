@@ -39,6 +39,8 @@ export type BestLine = {
   sport: string;
   game: string;
   line?: number | null;
+  player?: string;
+  prop_type?: "player_points" | "player_rebounds" | "player_assists" | string;
   home_team?: string;
   away_team?: string;
   home?: {
@@ -63,4 +65,40 @@ export type BestLine = {
     book: string;
     odds_am: number;
   };
+};
+
+export type MatchedMarket = {
+  market_type?: string;
+  selection?: string;
+  team?: string;
+  american_odds?: number;
+  decimal_odds?: number;
+  line_value?: number | null;
+};
+
+export type MatchedGame = {
+  sport: string;
+  start_time?: string;
+  home_team: string;
+  away_team: string;
+  matchScore?: number;
+  books: {
+    bovada: MatchedMarket[];
+    therundown: Record<string, unknown>[];
+  };
+};
+
+export type ScanNowResponse = {
+  ok: boolean;
+  sports?: string[];
+  lastScanMs?: number;
+  count?: number;
+  arbs?: Arb[];
+  lines?: RawLine[];
+  bestLines?: BestLine[];
+  matchedGames?: MatchedGame[];
+  bovadaError?: string | null;
+  error?: string;
+  dataAge?: number;
+  dpRemaining?: string;
 };

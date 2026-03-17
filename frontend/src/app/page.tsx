@@ -1,26 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { Arb, RawLine, BestLine } from "@/lib/types";
+import type { Arb, RawLine, BestLine, ScanNowResponse } from "@/lib/types";
 import { ArbCard } from "@/components/ArbCard";
 
 const DEFAULT_BASE = "http://127.0.0.1:3030";
 
 const SPORTS = ["NCAAF", "NFL", "MLB", "NBA", "NCAAB", "NHL", "NCAAWB", "MMA"] as const;
 type Sport = (typeof SPORTS)[number];
-
-type ScanNowResponse = {
-  ok: boolean;
-  sports?: string[];
-  lastScanMs?: number;
-  count?: number;
-  arbs?: Arb[];
-  lines?: RawLine[];
-  bestLines?: BestLine[];
-  error?: string;
-  dataAge?: number;
-  dpRemaining?: string;
-};
 
 export default function HomePage() {
   const baseUrl = process.env.NEXT_PUBLIC_ARBS_URL || DEFAULT_BASE;
@@ -350,11 +337,14 @@ export default function HomePage() {
               const ml = linesForEvent.filter((l) => l.type === "moneyline");
               const spreads = linesForEvent.filter((l) => l.type === "spread");
               const totals = linesForEvent.filter((l) => l.type === "total");
+              const props = linesForEvent.filter((l) => l.type === "prop");
 
               const spreadKey = `spread::${key}`;
               const totalKey = `total::${key}`;
+              const propKey = `prop::${key}`;
               const spreadsOpen = openDrawers.has(spreadKey);
               const totalsOpen = openDrawers.has(totalKey);
+              const propsOpen = openDrawers.has(propKey);
 
               const shortBook = (name: string) => {
                 const lower = name.toLowerCase();
@@ -465,7 +455,7 @@ export default function HomePage() {
                     })}
                   </div>
 
-                  {(spreads.length > 0 || totals.length > 0) && (
+                  {(spreads.length > 0 || totals.length > 0 || props.length > 0) && (
                     <div className="flex border-t border-zinc-800">
                       {spreads.length > 0 && (
                         <button
@@ -498,6 +488,23 @@ export default function HomePage() {
                           <span>{totalsOpen ? "▾" : "▸"}</span>
                           Totals
                           <span className="font-mono text-[10px] text-zinc-500">({totals.length})</span>
+                        </button>
+                      )}
+                      {props.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => toggleDrawer(propKey)}
+                          className={[
+                            "flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold transition",
+                            spreads.length > 0 || totals.length > 0 ? "border-l border-zinc-800" : "",
+                            propsOpen
+                              ? "bg-zinc-800/60 text-emerald-300"
+                              : "bg-zinc-900/20 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30",
+                          ].join(" ")}
+                        >
+                          <span>{propsOpen ? "▾" : "▸"}</span>
+                          Props
+                          <span className="font-mono text-[10px] text-zinc-500">({props.length})</span>
                         </button>
                       )}
                     </div>
@@ -654,12 +661,66 @@ export default function HomePage() {
                         })}
                     </div>
                   )}
+
+                  {propsOpen && props.length > 0 && (
+                    <div className="border-t border-zinc-800 px-5 py-3 space-y-1.5">
+                      {props
+                        .slice()
+                        .sort((a, b) => {
+                          const pCmp = (a.player ?? "").localeCompare(b.player ?? "");
+                          if (pCmp !== 0) return pCmp;
+                          const tCmp = (a.prop_type ?? "").localeCompare(b.prop_type ?? "");
+                          if (tCmp !== 0) return tCmp;
+                          return (a.line ?? 0) - (b.line ?? 0);
+                        })
+                        .map((bl, idx) => {
+                          if (!bl.over?.book || !bl.under?.book) return null;
+                          const pVal = pairValue(bl.over.odds_am, bl.under.odds_am);
+                          const propLabel = (bl.prop_type ?? "prop").replace(/^player_/, "").replace(/_/g, " ");
+                          return (
+                            <div
+                              key={`prop-${bl.player}-${bl.prop_type}-${bl.line}-${idx}`}
+                              className="flex flex-col gap-1 rounded-lg bg-zinc-800/40 px-3 py-2"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <span className="text-xs font-semibold text-zinc-200">
+                                  {bl.player ?? "Player"} - <span className="text-zinc-400 capitalize">{propLabel}</span>
+                                  {bl.line != null ? ` ${bl.line}` : ""}
+                                </span>
+                                {pVal != null && valueBadge(pVal)}
+                              </div>
+                              <div className="flex items-center gap-3 text-xs">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-[10px] text-zinc-500">O</span>
+                                  <span className={`font-mono ${oddsColor(bl.over.odds_am)}`}>
+                                    {formatOdds(bl.over.odds_am)}
+                                  </span>
+                                  <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                    {shortBook(bl.over.book)}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-[10px] text-zinc-500">U</span>
+                                  <span className={`font-mono ${oddsColor(bl.under.odds_am)}`}>
+                                    {formatOdds(bl.under.odds_am)}
+                                  </span>
+                                  <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                    {shortBook(bl.under.book)}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  )}
                 </div>
               );
             })
           )}
         </section>
       )}
+
     </main>
   );
 }

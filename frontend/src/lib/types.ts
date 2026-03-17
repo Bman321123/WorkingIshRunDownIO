@@ -33,3 +33,34 @@ export type RawLine = {
   odds_am: number;
   updated_at?: string | number | null;
 };
+
+export type BestLine = {
+  type?: "moneyline" | "spread" | "total" | string;
+  sport: string;
+  game: string;
+  line?: number | null;
+  home_team?: string;
+  away_team?: string;
+  home?: {
+    book: string;
+    odds_am: number;
+  };
+  away?: {
+    book: string;
+    odds_am: number;
+  };
+  over?: {
+    book: string;
+    odds_am: number;
+  };
+  under?: {
+    book: string;
+    odds_am: number;
+  };
+  side?: "home" | "away" | string;
+  team?: string;
+  pick?: {
+    book: string;
+    odds_am: number;
+  };
+};

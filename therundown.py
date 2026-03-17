@@ -26,6 +26,7 @@ TOTAL_STAKE:    float = 100.0
 POLL_INTERVAL:  int   = 60
 REQUEST_DELAY:  float = 1.2
 DAYS_AHEAD:     int   = 1
+BEST_LINES_MODE: bool = os.getenv("BEST_LINES_MODE", "0") == "1"
 
 # Live-game / near-arb configuration
 LIVE_ONLY:        bool = True
@@ -216,6 +217,52 @@ def to_decimal(val) -> float:
     if val > 1.0:
         return round(val, 6)  # already decimal
     return 0.0
+
+
+# ──────────────────────────────────────────────
+# BEST-LINE SELECTION (AMERICAN ODDS)
+# ──────────────────────────────────────────────
+def select_best_american_price(options: list[dict]) -> dict | None:
+    """
+    Given a list of price entries for the same outcome across books, select the
+    single best price according to American-odds shopping rules:
+
+      - If any prices are positive, choose the highest positive integer.
+      - If all prices are negative, choose the negative value closest to zero.
+      - If there is a mix of positive and negative, always choose the positive.
+
+    Each option is expected to have at least:
+        { "book": str, "price_am": int|float }
+    """
+    if not options:
+        return None
+
+    numeric: list[tuple[float, dict]] = []
+    for opt in options:
+        val = opt.get("price_am")
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+        if num == 0:
+            continue
+        numeric.append((num, opt))
+
+    if not numeric:
+        return None
+
+    positives = [(v, o) for (v, o) in numeric if v > 0]
+    negatives = [(v, o) for (v, o) in numeric if v < 0]
+
+    if positives:
+        # Highest positive value
+        _, best = max(positives, key=lambda t: t[0])
+        return best
+    if negatives:
+        # Negative closest to zero => numerically largest
+        _, best = max(negatives, key=lambda t: t[0])
+        return best
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -485,12 +532,11 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
 # ──────────────────────────────────────────────
 # ARBITRAGE CORE
 # ──────────────────────────────────────────────
-def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]:
+def _resolve_teams(event: dict) -> tuple[str, str, str]:
     """
-    Find all near-arb and arb situations for an event.
-    Returns (list_of_arbs, list_of_raw_lines).
+    Resolve game and team labels (away @ home) for a given event.
+    Returns (game_label, home_name, away_name).
     """
-    # Prefer explicit home/away flags from event["teams"], fall back to teams_normalized.
     teams = event.get("teams") or []
     if teams:
         home_team = next((t for t in teams if t.get("is_home")), teams[-1])
@@ -501,7 +547,17 @@ def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]
         tn = event.get("teams_normalized", [])
         home = tn[0].get("name", "Home") if len(tn) > 0 else "Home"
         away = tn[1].get("name", "Away") if len(tn) > 1 else "Away"
-    game  = f"{away} @ {home}"
+    game = f"{away} @ {home}"
+    return game, home, away
+
+
+def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]:
+    """
+    Find all near-arb and arb situations for an event.
+    Returns (list_of_arbs, list_of_raw_lines).
+    """
+    # Prefer explicit home/away flags from event["teams"], fall back to teams_normalized.
+    game, home, away = _resolve_teams(event)
 
     market_index, spread_pairs, raw_book_ids, used_book_ids = build_market_index(event)
     if not market_index:
@@ -739,6 +795,175 @@ def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]
 
 
 # ──────────────────────────────────────────────
+# BEST-LINE AGGREGATION (MONEYLINE ONLY)
+# ──────────────────────────────────────────────
+def compute_best_moneyline_for_event(event: dict, sport_name: str) -> dict | None:
+    """
+    For a single head-to-head event, compute the best available Moneyline for
+    each side (home, away) across all books, according to American-odds rules.
+
+    Returns:
+        {
+            "sport": str,
+            "game": str,
+            "home_team": str,
+            "away_team": str,
+            "home": {"book": str, "odds_am": int|float},
+            "away": {"book": str, "odds_am": int|float},
+        }
+    or None if no valid moneyline data is available for both sides.
+    """
+    game, home_name, away_name = _resolve_teams(event)
+    market_index, _spread_pairs, _raw_book_ids, _used_book_ids = build_market_index(event)
+    if not market_index:
+        return None
+
+    ml_sides = None
+    for (kind, line_value), sides in market_index.items():
+        if kind == "ml":
+            ml_sides = sides
+            break
+    if not ml_sides:
+        return None
+
+    home_options = ml_sides.get("home") or []
+    away_options = ml_sides.get("away") or []
+    if not home_options or not away_options:
+        return None
+
+    best_home = select_best_american_price(home_options)
+    best_away = select_best_american_price(away_options)
+    if not best_home or not best_away:
+        return None
+
+    return {
+        "sport": sport_name,
+        "game": game,
+        "home_team": home_name,
+        "away_team": away_name,
+        "home": {
+            "book": best_home["book"],
+            "odds_am": best_home["price_am"],
+        },
+        "away": {
+            "book": best_away["book"],
+            "odds_am": best_away["price_am"],
+        },
+    }
+
+
+# ──────────────────────────────────────────────
+# BEST-LINE AGGREGATION (ALL MAIN MARKETS)
+# ──────────────────────────────────────────────
+def compute_best_lines_for_event(event: dict, sport_name: str) -> list[dict]:
+    """
+    For a single head-to-head event, compute the best available odds across
+    Moneyline, Spread, and Total markets.
+
+    Returns a list of normalized best-line objects:
+        Moneyline (paired home/away):
+            { "type": "moneyline", "sport", "game", "home_team", "away_team",
+              "home": {"book", "odds_am"}, "away": {"book", "odds_am"} }
+        Spread (one entry per signed side):
+            { "type": "spread", "line": signed_float, "side": "home"|"away",
+              "team": str, "sport", "game",
+              "pick": {"book", "odds_am"} }
+        Total (paired over/under):
+            { "type": "total", "line": float,
+              "sport", "game",
+              "over": {"book", "odds_am"}, "under": {"book", "odds_am"} }
+    """
+    game, home_name, away_name = _resolve_teams(event)
+    market_index, _spread_pairs, _raw_book_ids, _used_book_ids = build_market_index(event)
+    if not market_index:
+        return []
+
+    results: list[dict] = []
+
+    for (kind, line_value), sides in market_index.items():
+        if kind == "ml":
+            home_options = sides.get("home") or []
+            away_options = sides.get("away") or []
+            if not home_options or not away_options:
+                continue
+            best_home = select_best_american_price(home_options)
+            best_away = select_best_american_price(away_options)
+            if not best_home or not best_away:
+                continue
+            results.append(
+                {
+                    "type": "moneyline",
+                    "sport": sport_name,
+                    "game": game,
+                    "home_team": home_name,
+                    "away_team": away_name,
+                    "home": {
+                        "book": best_home["book"],
+                        "odds_am": best_home["price_am"],
+                    },
+                    "away": {
+                        "book": best_away["book"],
+                        "odds_am": best_away["price_am"],
+                    },
+                }
+            )
+        elif kind == "spread":
+            for side_key, team_name in [("home", home_name), ("away", away_name)]:
+                options = sides.get(side_key) or []
+                if not options:
+                    continue
+                best = select_best_american_price(options)
+                if not best:
+                    continue
+                results.append(
+                    {
+                        "type": "spread",
+                        "line": line_value,
+                        "side": side_key,
+                        "team": team_name,
+                        "sport": sport_name,
+                        "game": game,
+                        "pick": {
+                            "book": best["book"],
+                            "odds_am": best["price_am"],
+                        },
+                    }
+                )
+        elif kind == "total":
+            over_options = sides.get("over") or []
+            under_options = sides.get("under") or []
+            if not over_options or not under_options:
+                continue
+            best_over = select_best_american_price(over_options)
+            best_under = select_best_american_price(under_options)
+            if not best_over or not best_under:
+                continue
+            results.append(
+                {
+                    "type": "total",
+                    "line": line_value,
+                    "sport": sport_name,
+                    "game": game,
+                    "over": {
+                        "book": best_over["book"],
+                        "odds_am": best_over["price_am"],
+                    },
+                    "under": {
+                        "book": best_under["book"],
+                        "odds_am": best_under["price_am"],
+                    },
+                }
+            )
+
+    if results:
+        ml_c = sum(1 for r in results if r["type"] == "moneyline")
+        sp_c = sum(1 for r in results if r["type"] == "spread")
+        to_c = sum(1 for r in results if r["type"] == "total")
+        print(f"    BEST_LINES [{sport_name}] {game}: {ml_c} ML, {sp_c} spread, {to_c} total")
+
+    return results
+
+# ──────────────────────────────────────────────
 # DISPLAY
 # ──────────────────────────────────────────────
 def _format_staleness(updated_at) -> str:
@@ -844,6 +1069,27 @@ def display_results(all_results: list, books_seen: set, events_checked: int):
     print(f"  True arbs: {len(true_arbs)}  |  Near-arb: {len(near_arbs) if SHOW_NEAR_ARBS else 0}\n")
 
 
+def display_best_moneylines(best_lines: list[dict], events_checked: int):
+    """Render a simple table of best Moneyline per event (home & away)."""
+    print(f"\n{'═'*80}")
+    print(f"  BEST LINE VIEW  |  {events_checked} events with moneyline data")
+    print(f"{'═'*80}")
+
+    if not best_lines:
+        print("\n  No moneyline data available for the selected sports/date window.\n")
+        return
+
+    table = PrettyTable(["Sport", "Game", "Home (Book @ Odds)", "Away (Book @ Odds)"])
+    table.align = "l"
+    for row in best_lines:
+        home = row["home"]
+        away = row["away"]
+        home_str = f"{row['home_team']} – {home['book']} ({home['odds_am']:+})"
+        away_str = f"{row['away_team']} – {away['book']} ({away['odds_am']:+})"
+        table.add_row([row["sport"], row["game"], home_str, away_str])
+    print(table)
+
+
 def display_coverage(sport_event_counts: dict):
     t = PrettyTable(["Sport", "ID", "Events", "Lines Checked"])
     t.align = "l"
@@ -887,6 +1133,7 @@ def main():
     print("=" * 70)
 
     all_results      = []
+    all_best_lines   = []
     books_seen       = set()
     total_events     = 0
     sport_counts     = {}
@@ -958,7 +1205,7 @@ def main():
         return kept
 
     def _analyze_events(filtered, sname):
-        """Run analyze_event on a list of filtered events."""
+        """Run analyze_event on a list of filtered events (arb mode)."""
         arbs = []
         lines = []
         bks  = set()
@@ -973,6 +1220,19 @@ def main():
             lines.extend(r_lines)
         return arbs, lines, bks
 
+    def _collect_best_lines(filtered, sname):
+        """Collect best Moneyline per event (Best Line mode)."""
+        bests = []
+        bks = set()
+        for event in filtered:
+            best = compute_best_moneyline_for_event(event, sname)
+            if not best:
+                continue
+            bests.append(best)
+            bks.add(best["home"]["book"])
+            bks.add(best["away"]["book"])
+        return bests, bks
+
     for sport_id in SPORT_IDS:
         if daily_exhausted:
             break
@@ -985,32 +1245,60 @@ def main():
             break
 
         filtered_today = _filter_live(raw_today)
-        arbs_today, lines_today, books_today = _analyze_events(filtered_today, sname)
 
-        if arbs_today:
-            sport_counts[sport_id] = (sname, len(filtered_today))
-            total_events += len(filtered_today)
-            books_seen.update(books_today)
-            all_results.extend(arbs_today)
-        else:
-            # -- Fallback to tomorrow if no arbs today and DAYS_AHEAD >= 1 --
-            if len(dates) > 1:
-                print(f"  [{sname}] no arbs today, checking {dates[1]}…")
-                raw_tmrw, quota_hit = _fetch_events_for_date(client, sport_id, sname, dates[1])
-                if quota_hit:
-                    daily_exhausted = True
-                    break
-                filtered_tmrw = _filter_live(raw_tmrw)
-                arbs_tmrw, lines_tmrw, books_tmrw = _analyze_events(filtered_tmrw, sname)
-                sport_counts[sport_id] = (sname, len(filtered_tmrw))
-                total_events += len(filtered_tmrw)
-                books_seen.update(books_tmrw)
-                all_results.extend(arbs_tmrw)
-            else:
+        if BEST_LINES_MODE:
+            best_today, books_today = _collect_best_lines(filtered_today, sname)
+            if best_today:
                 sport_counts[sport_id] = (sname, len(filtered_today))
                 total_events += len(filtered_today)
+                books_seen.update(books_today)
+                all_best_lines.extend(best_today)
+            else:
+                if len(dates) > 1:
+                    print(f"  [{sname}] no moneylines today, checking {dates[1]}…")
+                    raw_tmrw, quota_hit = _fetch_events_for_date(client, sport_id, sname, dates[1])
+                    if quota_hit:
+                        daily_exhausted = True
+                        break
+                    filtered_tmrw = _filter_live(raw_tmrw)
+                    best_tmrw, books_tmrw = _collect_best_lines(filtered_tmrw, sname)
+                    sport_counts[sport_id] = (sname, len(filtered_tmrw))
+                    total_events += len(filtered_tmrw)
+                    books_seen.update(books_tmrw)
+                    all_best_lines.extend(best_tmrw)
+                else:
+                    sport_counts[sport_id] = (sname, len(filtered_today))
+                    total_events += len(filtered_today)
+        else:
+            arbs_today, lines_today, books_today = _analyze_events(filtered_today, sname)
+
+            if arbs_today:
+                sport_counts[sport_id] = (sname, len(filtered_today))
+                total_events += len(filtered_today)
+                books_seen.update(books_today)
+                all_results.extend(arbs_today)
+            else:
+                # -- Fallback to tomorrow if no arbs today and DAYS_AHEAD >= 1 --
+                if len(dates) > 1:
+                    print(f"  [{sname}] no arbs today, checking {dates[1]}…")
+                    raw_tmrw, quota_hit = _fetch_events_for_date(client, sport_id, sname, dates[1])
+                    if quota_hit:
+                        daily_exhausted = True
+                        break
+                    filtered_tmrw = _filter_live(raw_tmrw)
+                    arbs_tmrw, lines_tmrw, books_tmrw = _analyze_events(filtered_tmrw, sname)
+                    sport_counts[sport_id] = (sname, len(filtered_tmrw))
+                    total_events += len(filtered_tmrw)
+                    books_seen.update(books_tmrw)
+                    all_results.extend(arbs_tmrw)
+                else:
+                    sport_counts[sport_id] = (sname, len(filtered_today))
+                    total_events += len(filtered_today)
 
     display_coverage(sport_counts)
+    if BEST_LINES_MODE:
+        display_best_moneylines(all_best_lines, total_events)
+        return
     display_results(all_results, books_seen, total_events)
 
     # ── Delta polling ──────────────────────────

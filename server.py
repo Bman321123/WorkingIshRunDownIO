@@ -110,7 +110,7 @@ _STORE = EventStore()
 # ──────────────────────────────────────────────
 # SCAN: SNAPSHOT + ANALYZE
 # ──────────────────────────────────────────────
-def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict]]:
+def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Fetch fresh events (snapshot + delta merge), then run arbitrage analysis.
     Returns (arbs, raw_lines).
@@ -169,6 +169,7 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict]]:
     # Analyze all events in the store
     all_results: list[dict] = []
     all_raw_lines: list[dict] = []
+    all_best_lines: list[dict] = []
 
     for sport_id in sport_ids:
         events = _STORE.get_events(sport_id)
@@ -204,11 +205,17 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict]]:
         books_in_batch: set[str] = set()
         for evt in active_events:
             new_arbs, new_lines = therundown.analyze_event(evt, sport_name)
+            best_lines_for_event = therundown.compute_best_lines_for_event(evt, sport_name)
+
             for line in new_lines:
                 books_in_batch.add(line["book"].lower())
-                print(f"     RAW LINE :: [{line['sport']}] {line['game']} | {line['book']} | {line['market_kind'].upper()} {line.get('line_label','')} {line['side']} ({line['odds_am']})")
+                print(
+                    f"     RAW LINE :: [{line['sport']}] {line['game']} | {line['book']} | "
+                    f"{line['market_kind'].upper()} {line.get('line_label','')} {line['side']} ({line['odds_am']})"
+                )
             all_results.extend(new_arbs)
             all_raw_lines.extend(new_lines)
+            all_best_lines.extend(best_lines_for_event)
 
         if active_events and "betmgm" not in books_in_batch:
             print(f"  ⚠ BETMGM NOT FOUND in {sport_name} ({len(active_events)} events)")
@@ -216,9 +223,13 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict]]:
     all_results.sort(key=lambda r: float(r.get("profit", 0.0)), reverse=True)
 
     data_age = _STORE.freshest_update_age()
-    print(f"  ── Scan complete: {len(all_results)} arbs, {len(all_raw_lines)} lines, data age: {int(data_age)}s, dp_remaining: {_STORE.dp_remaining}")
+    print(
+        "  ── Scan complete: "
+        f"{len(all_results)} arbs, {len(all_raw_lines)} lines, {len(all_best_lines)} best-lines, "
+        f"data age: {int(data_age)}s, dp_remaining: {_STORE.dp_remaining}"
+    )
 
-    return all_results, all_raw_lines
+    return all_results, all_raw_lines, all_best_lines
 
 
 # ──────────────────────────────────────────────
@@ -228,6 +239,7 @@ class ArbState:
     def __init__(self):
         self.arbs: list[dict] = []
         self.lines: list[dict] = []
+        self.best_lines: list[dict] = []
         self.last_scan_ms: int | None = None
         self.last_error: str | None = None
         self.last_scan_sports: list[str] = []
@@ -251,6 +263,7 @@ async def handle_arbs(request: web.Request) -> web.Response:
     return web.json_response({
         "arbs": state.arbs,
         "lines": state.lines,
+        "bestLines": state.best_lines,
         "dataAge": int(_STORE.freshest_update_age()),
         "dpRemaining": _STORE.dp_remaining,
     }, dumps=lambda x: json.dumps(x, default=_serialize))
@@ -299,9 +312,10 @@ async def handle_scan_now(request: web.Request) -> web.Response:
 
     try:
         state.last_error = None
-        arbs, lines = await asyncio.to_thread(scan_arbs_once, selected_ids)
+        arbs, lines, best_lines = await asyncio.to_thread(scan_arbs_once, selected_ids)
         state.arbs = arbs
         state.lines = lines
+        state.best_lines = best_lines
         state.last_scan_ms = _now_ms()
         state.last_scan_sports = selected_names
         resp = web.json_response(
@@ -312,6 +326,7 @@ async def handle_scan_now(request: web.Request) -> web.Response:
                 "count": len(state.arbs),
                 "arbs": state.arbs,
                 "lines": state.lines,
+                "bestLines": state.best_lines,
                 "dataAge": int(_STORE.freshest_update_age()),
                 "dpRemaining": _STORE.dp_remaining,
             },
@@ -332,9 +347,10 @@ async def scan_loop(app: web.Application):
     while True:
         try:
             state.last_error = None
-            arbs, lines = scan_arbs_once(sport_ids)
+            arbs, lines, best_lines = scan_arbs_once(sport_ids)
             state.arbs = arbs
             state.lines = lines
+            state.best_lines = best_lines
             state.last_scan_ms = _now_ms()
             state.last_scan_sports = [_sport_name_by_id().get(sid, str(sid)) for sid in sport_ids]
         except Exception as e:

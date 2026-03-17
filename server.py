@@ -152,6 +152,34 @@ class EventStore:
 
 _STORE = EventStore()
 
+# ──────────────────────────────────────────────
+# MODULE-LEVEL CLIENT (one Session for process lifetime)
+# ──────────────────────────────────────────────
+# Shared across all scan_arbs_once() calls. scan_arbs_once() is called
+# serially (asyncio.to_thread, one at a time), so no locking is needed.
+_CLIENT = therundown.RundownClient(therundown.API_KEY, therundown.USE_RAPIDAPI)
+
+# Affiliate cache — /affiliates data changes at most monthly; refresh daily.
+_AFFILIATES_TTL: int = 86400
+_affiliates_last_fetched: float = 0.0
+
+
+def _refresh_affiliates_if_stale() -> None:
+    """Fetch affiliate names at most once every _AFFILIATES_TTL seconds."""
+    global _affiliates_last_fetched
+    if time.time() - _affiliates_last_fetched < _AFFILIATES_TTL:
+        return
+    fresh = therundown.fetch_affiliates()
+    if fresh:
+        merged = dict(therundown._KNOWN_BOOKS_FALLBACK)
+        merged.update(fresh)
+        therundown.KNOWN_BOOKS = merged
+        _affiliates_last_fetched = time.time()
+        print(f"  AFFILIATES :: refreshed ({len(fresh)} books cached for {_AFFILIATES_TTL}s)")
+    else:
+        # Keep existing KNOWN_BOOKS and retry on next scan.
+        print("  AFFILIATES :: refresh failed, retaining existing book names")
+
 
 # ──────────────────────────────────────────────
 # SCAN: SNAPSHOT + ANALYZE
@@ -161,14 +189,9 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
     Fetch fresh events (snapshot + delta merge), then run arbitrage analysis.
     Returns (arbs, raw_lines).
     """
-    # Ensure affiliate names include the fallback
-    fresh = therundown.fetch_affiliates()
-    if fresh:
-        merged = dict(therundown._KNOWN_BOOKS_FALLBACK)
-        merged.update(fresh)
-        therundown.KNOWN_BOOKS = merged
+    _refresh_affiliates_if_stale()
 
-    client = therundown.RundownClient(therundown.API_KEY, therundown.USE_RAPIDAPI)
+    client = _CLIENT
     today_dt = therundown.datetime.date.today()
     today = today_dt.strftime("%Y-%m-%d")
     tomorrow = (today_dt + therundown.datetime.timedelta(days=1)).strftime("%Y-%m-%d")
@@ -312,10 +335,10 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
                 _STORE.set_snapshot(sport_id, events, cursor)
                 _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
                 print(f"  SNAPSHOT :: sport {sport_id} loaded {len(events)} events (cursor={str(cursor)[:12]}…)")
-                time.sleep(1.2)
+                time.sleep(therundown.get_safe_delay())
             except Exception as e:
                 print(f"  SNAPSHOT :: sport {sport_id} failed: {e}")
-                time.sleep(1.2)
+                time.sleep(therundown.get_safe_delay())
         else:
             age = int(time.time() - _STORE.snapshot_ts.get(sport_id, 0))
             print(f"  SNAPSHOT :: sport {sport_id} using cached data ({age}s old, max {SNAPSHOT_MAX_AGE}s)")
@@ -337,11 +360,11 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
                     # But we can update the cursor so the next snapshot is fresher.
                 else:
                     print(f"  DELTA :: sport {sport_id} no changes (cursor → {str(new_cursor)[:12]}…)")
-                time.sleep(1.2)
+                time.sleep(therundown.get_safe_delay())
             except Exception as e:
                 print(f"  DELTA :: sport {sport_id} failed ({e}), cursor may be stale — will re-bootstrap next scan")
                 _STORE.snapshot_ts[sport_id] = 0  # Force re-bootstrap
-                time.sleep(1.2)
+                time.sleep(therundown.get_safe_delay())
 
     # Analyze all events in the store
     all_results: list[dict] = []
@@ -371,7 +394,7 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
                 _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
                 active_events = _filter_active_events(merged_events)
                 analysis_date = tomorrow
-                time.sleep(1.2)
+                time.sleep(therundown.get_safe_delay())
             except Exception as e:
                 print(f"  FALLBACK :: {sport_name} tomorrow fetch failed: {e}")
 

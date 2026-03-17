@@ -192,14 +192,42 @@ class ApiKeyRotationState:
 
 _API_KEY_STATE = ApiKeyRotationState(API_KEYS)
 
+# Updated from the X-Rate-Limit response header after each successful call.
+# Starts at 1 (free-tier default) so REQUEST_DELAY is used until we see a
+# response that tells us otherwise.
+_observed_rate_limit: int = 1
+
+
+def get_safe_delay() -> float:
+    """
+    Compute the safe inter-request sleep interval from the most recently
+    observed X-Rate-Limit header value.
+
+    Adds a 50ms safety buffer above the theoretical minimum (1/rate_limit)
+    to stay comfortably under the burst ceiling under minor clock skew.
+    Falls back to the configured REQUEST_DELAY until the first response is
+    seen (i.e. while _observed_rate_limit is still 1 / free-tier default).
+
+    Tier reference:
+      free (1/s)    -> REQUEST_DELAY (1.2s default)
+      starter (2/s) -> 0.55s
+      pro (5/s)     -> 0.25s
+      ultra (10/s)  -> 0.15s
+      super (15/s)  -> 0.12s
+      mega (20/s)   -> 0.10s
+    """
+    if _observed_rate_limit <= 1:
+        return REQUEST_DELAY
+    return round(1.0 / _observed_rate_limit + 0.05, 3)
+
 
 def _parse_retry_after_seconds(resp_headers: dict) -> int:
-    """Prefer Retry-After header; fallback to 60s."""
-    raw = (
-        resp_headers.get("retry-after")
-        or resp_headers.get("Retry-After")
-        or resp_headers.get("x-retry-after")
-    )
+    """Return Retry-After seconds from response headers; fallback to 60s.
+
+    requests.Response.headers is a CaseInsensitiveDict, so a single lookup
+    covers all capitalisation variants (retry-after, Retry-After, etc.).
+    """
+    raw = resp_headers.get("retry-after")
     try:
         return max(int(float(raw)), 1)
     except (TypeError, ValueError):
@@ -281,6 +309,15 @@ class RundownClient:
             dp_cost = resp.headers.get("X-Datapoints", "?")
             dp_used = resp.headers.get("X-Datapoints-Used", "?")
             dp_rem  = resp.headers.get("X-Datapoints-Remaining", "?")
+            # Update the observed rate-limit ceiling so get_safe_delay() can
+            # compute the tightest safe inter-request interval for this key.
+            global _observed_rate_limit
+            _rl_raw = resp.headers.get("X-Rate-Limit")
+            if _rl_raw:
+                try:
+                    _observed_rate_limit = max(1, int(_rl_raw))
+                except (TypeError, ValueError):
+                    pass
             print(f"API_RESPONSE: HTTP {resp.status_code} | {len(raw_payload)} bytes | dp_cost={dp_cost} used={dp_used} remaining={dp_rem}")
             resp.raise_for_status()
             return resp.json()
@@ -361,6 +398,7 @@ class RundownClient:
             "last_id": last_id,
             "sport_id": sport_id,
             "market_ids": "1,2,3",
+            "affiliate_ids": "22,19,23",   # BetMGM (22), DraftKings (19), FanDuel (23)
         })
 
     def get_delta(self, sport_id, last_id):

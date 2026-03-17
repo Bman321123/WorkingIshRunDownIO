@@ -1,21 +1,35 @@
 """
-Run this ONCE to dump the raw API response structure.
+Run this ONCE to dump the raw API response structure for a given sport/date.
 
 Usage:
-    .venv/bin/python debug_structure.py
+    THERUNDOWN_API_KEY=your_key .venv/bin/python debug_structure.py
+    THERUNDOWN_API_KEY=your_key .venv/bin/python debug_structure.py 4 2026-04-01
 """
 
+import datetime
 import json
+import os
+import sys
 
 import requests
 
 
-API_KEY = "10c79a340413a26b827a2d34b0c32e86e7bf5c964eb4d4c3b8e8cadc995d1c58"
+API_KEY = os.getenv("THERUNDOWN_API_KEY", "").strip()
+if not API_KEY:
+    raise SystemExit(
+        "ERROR: set the THERUNDOWN_API_KEY environment variable before running this script.\n"
+        "  export THERUNDOWN_API_KEY=your_key_here"
+    )
+
+SPORT_ID = int(sys.argv[1]) if len(sys.argv) > 1 else 4
+DATE_STR = sys.argv[2] if len(sys.argv) > 2 else datetime.date.today().strftime("%Y-%m-%d")
 
 
 def main() -> None:
+    url = f"https://therundown.io/api/v2/sports/{SPORT_ID}/events/{DATE_STR}"
+    print(f"Fetching: {url}\n")
     resp = requests.get(
-        "https://therundown.io/api/v2/sports/4/events/2026-03-04",
+        url,
         headers={"X-TheRundown-Key": API_KEY, "Accept": "application/json"},
         timeout=15,
     )
